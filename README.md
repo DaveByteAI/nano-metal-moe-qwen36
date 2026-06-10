@@ -1,8 +1,16 @@
 # nano-metal-moe-qwen36
 
 `nmoe` is a compact Apple Silicon Metal runtime for local Qwen3.6-35B-A3B
-inference. The public tree is intentionally small: one command-line binary, the
-Metal kernels, and a model conversion script.
+inference on a base Mac mini with 16GB unified memory. The public tree is kept
+small: one command-line binary, the Metal kernels, and a model conversion
+script.
+
+The core idea is to keep the shared model weights resident while treating the
+routed MoE experts as quantized external packs. Each layer selects only the
+top-k experts needed for the current token, then loads and runs just those
+expert weights instead of keeping all 256 experts hot in memory. q4 and q2
+expert packs reduce bandwidth and storage pressure further, which is what makes
+this setup practical on a 16GB machine.
 
 ## What Is Included
 
