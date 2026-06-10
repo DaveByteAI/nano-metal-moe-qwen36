@@ -1,0 +1,7 @@
+/nmoe
+*.o
+*.dSYM/
+*.tmp
+/qwen36_35b
+/qwen36_35b/
+*.log
