@@ -7,7 +7,7 @@ Metal kernels, and a model conversion script.
 ## What Is Included
 
 - `ask`, `chat`, and `bench` commands
-- q4 and q2 routed expert packs
+- Support for q4 and q2 routed expert packs
 - Metal kernels for the runtime hot path
 - A Python converter for Hugging Face safetensors expert weights
 
@@ -70,14 +70,17 @@ The converter writes `packed_experts/` for q4 or `packed_experts_2bit/` for q2:
 
 ```bash
 python3 scripts/convert_qwen36.py \
-  --model /path/to/Qwen3.6-35B-A3B \
-  --output qwen36_35b \
+  --model-dir /path/to/Qwen3.6-35B-A3B \
+  --output-root qwen36_35b \
   --quant 4
 
 python3 scripts/convert_qwen36.py \
-  --model /path/to/Qwen3.6-35B-A3B \
-  --output qwen36_35b \
+  --model-dir /path/to/Qwen3.6-35B-A3B \
+  --output-root qwen36_35b \
   --quant 2
 ```
+
+Use `--quant both` to generate both directories in one run. Add `--force` if the
+output directory already exists and should be overwritten.
 
 Python dependencies: `numpy` and `safetensors`.
