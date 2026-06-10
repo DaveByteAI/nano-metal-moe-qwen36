@@ -12,6 +12,42 @@ expert weights instead of keeping all 256 experts hot in memory. q4 and q2
 expert packs reduce bandwidth and storage pressure further, which is what makes
 this setup practical on a 16GB machine.
 
+## Architecture
+
+```mermaid
+flowchart LR
+    HF["Hugging Face\nQwen/Qwen3.6-35B-A3B"] --> CONVERT["scripts/convert_qwen36.py\nBF16 safetensors -> nmoe package"]
+
+    CONVERT --> STATIC["model_weights.bin/json\nshared non-expert tensors\nmmap + Metal buffer"]
+    CONVERT --> TOK["tokenizer.bin + vocab.bin\nprompt encode / token decode"]
+    CONVERT --> EXPERTS["packed_experts/\nq4 or q2 routed expert packs\n40 layers x 256 experts"]
+
+    USER["ask / chat / bench"] --> TOKENIZE["Tokenizer"]
+    TOK --> TOKENIZE
+    TOKENIZE --> RUNTIME["nmoe runtime\n40-layer Qwen3.6 MoE decode loop"]
+
+    STATIC --> RUNTIME
+    RUNTIME --> ROUTER["GPU router\nselect top-k experts per layer"]
+    ROUTER --> EXPERT_LOAD["Expert loader\nread only selected experts"]
+    EXPERTS --> EXPERT_LOAD
+
+    RUNTIME --> METAL["Metal kernels\nattention + shared expert + routed expert"]
+    EXPERT_LOAD --> METAL
+    METAL --> OUTPUT["Generated tokens"]
+    OUTPUT --> TOK
+```
+
+What makes this project different:
+
+- It keeps the shared Qwen3.6 tensors resident, but leaves routed experts in
+  compact per-layer packs.
+- Each token activates only the top-k routed experts, so the runtime reads and
+  runs a tiny fraction of the 256 experts per layer.
+- The hot path is a single native Objective-C/Metal binary, with no Python or
+  server process in the inference loop.
+- The same model package can carry q4 experts for quality or q2 experts for
+  lower bandwidth experiments.
+
 ## What Is Included
 
 - `ask`, `chat`, and `bench` commands
