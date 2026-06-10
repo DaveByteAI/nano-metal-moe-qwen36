@@ -14,27 +14,65 @@ this setup practical on a 16GB machine.
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    HF["Hugging Face\nQwen/Qwen3.6-35B-A3B"] --> CONVERT["scripts/convert_qwen36.py\nBF16 safetensors -> nmoe package"]
+```text
+Hugging Face: Qwen/Qwen3.6-35B-A3B
+        |
+        v
+scripts/convert_qwen36.py
+BF16 safetensors -> nmoe runtime package
+        |
+        +--> model_weights.bin/json
+        |    shared non-expert tensors
+        |    mmap + Metal buffer
+        |
+        +--> tokenizer.bin + vocab.bin
+        |    prompt encode / token decode
+        |
+        +--> packed_experts/
+             q4 or q2 routed expert packs
+             40 layers x 256 experts
 
-    CONVERT --> STATIC["model_weights.bin/json\nshared non-expert tensors\nmmap + Metal buffer"]
-    CONVERT --> TOK["tokenizer.bin + vocab.bin\nprompt encode / token decode"]
-    CONVERT --> EXPERTS["packed_experts/\nq4 or q2 routed expert packs\n40 layers x 256 experts"]
+Runtime path
+------------
 
-    USER["ask / chat / bench"] --> TOKENIZE["Tokenizer"]
-    TOK --> TOKENIZE
-    TOKENIZE --> RUNTIME["nmoe runtime\n40-layer Qwen3.6 MoE decode loop"]
-
-    STATIC --> RUNTIME
-    RUNTIME --> ROUTER["GPU router\nselect top-k experts per layer"]
-    ROUTER --> EXPERT_LOAD["Expert loader\nread only selected experts"]
-    EXPERTS --> EXPERT_LOAD
-
-    RUNTIME --> METAL["Metal kernels\nattention + shared expert + routed expert"]
-    EXPERT_LOAD --> METAL
-    METAL --> OUTPUT["Generated tokens"]
-    OUTPUT --> TOK
+ask / chat / bench
+        |
+        v
+Tokenizer
+prompt encode using tokenizer.bin + vocab.bin
+        |
+        v
+nmoe runtime
+40-layer Qwen3.6 MoE decode loop
+        |
+        +--> shared weights resident
+        |    model_weights.bin/json
+        |         |
+        |         v
+        |    Metal kernels
+        |    attention + shared expert
+        |
+        +--> GPU router
+        |    select top-k experts per layer
+        |         |
+        |         v
+        |    expert loader
+        |    read only selected expert packs
+        |    from packed_experts/
+        |         |
+        |         v
+        |    Metal kernels
+        |    routed expert
+        |
+        v
+generated tokens
+        |
+        v
+Tokenizer
+decode using tokenizer.bin + vocab.bin
+        |
+        v
+output text
 ```
 
 What makes this project different:
