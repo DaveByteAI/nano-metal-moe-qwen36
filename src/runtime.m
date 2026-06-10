@@ -3533,7 +3533,7 @@ static uint32_t NMOEProcessToken(nmoe_runtime *rt, uint32_t token, BOOL computeL
             (void)NMOERunDequantMatVecMetal(rt, @"lm_head", rt->normBuffer, 0, rt->logitsBuffer, 0, 248320u, kNMOEHiddenDim, 4);
             if (!NMOERunArgmaxTop1Metal(rt, rt->logitsBuffer, 0, 248320u, &nextToken)) { fprintf(stderr, "argmax failed\n"); abort(); }
         }
-        if (rt->inThink) { rt->thinkCount += 1; if (rt->cfg.think_budget >= 0 && (size_t)rt->cfg.think_budget <= rt->thinkCount) nextToken = kNMOEThinkEnd; }
+        if (rt->inThink) { rt->thinkCount += 1; if (rt->cfg.think_budget > 0 && (size_t)rt->cfg.think_budget <= rt->thinkCount) nextToken = kNMOEThinkEnd; }
         NMOETraceGenerationToken(rt, nextToken);
         if (nextToken == kNMOEThinkStart) { rt->inThink = YES; rt->thinkCount = 0; }
         else if (nextToken == kNMOEThinkEnd) { rt->inThink = NO; }

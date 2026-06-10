@@ -1,573 +1,574 @@
 #!/usr/bin/env python3
-"""Convert Qwen3.6 routed experts into the packed layout used by nmoe."""
+"""Prepare Qwen3.6-35B-A3B BF16 safetensors for nano-metal-moe.
+
+This converts Hugging Face BF16 weights into the runtime format used by
+`nmoe`:
+
+  output/
+    model_weights.bin/json       quantized non-expert weights + native vectors
+    packed_experts/layer_XX.bin  split gate/up/down experts in 4-bit affine form
+    tokenizer.bin                optional, if tokenizer.json exists
+    vocab.bin                    optional, if tokenizer.json exists
+
+The script streams large tensors in chunks, so it does not need to hold the full
+model in RAM. It does need all 26 safetensors shards to be present.
+"""
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
-from dataclasses import dataclass
+import os
+import struct
+import sys
+import time
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
-from safetensors.numpy import safe_open
 
 
+HIDDEN_DIM = 2048
 NUM_LAYERS = 40
 NUM_EXPERTS = 256
 GROUP_SIZE = 64
-GATE_ROWS = 512
-UP_ROWS = 512
-DOWN_ROWS = 2048
-GATE_COLS = 2048
-UP_COLS = 2048
-DOWN_COLS = 512
-Q4_BITS = 4
-Q2_BITS = 2
+MOE_INTERMEDIATE = 512
+VOCAB_SIZE = 248320
 
-ROLE_SHAPES = {
-    "gate_proj": (GATE_ROWS, GATE_COLS),
-    "up_proj": (UP_ROWS, UP_COLS),
-    "down_proj": (DOWN_ROWS, DOWN_COLS),
-}
+EXPERT_SIZE_4BIT = 1_769_472
 
-ROLE_ALIASES = {
-    "gate_proj": ("gate_proj", "w1", "gate", "w_gate"),
-    "up_proj": ("up_proj", "w3", "up", "w_up"),
-    "down_proj": ("down_proj", "w2", "down", "w_down"),
-}
+EXPERT_LAYOUT = [
+    ("gate_proj.weight", 0, 524_288),
+    ("gate_proj.scales", 524_288, 32_768),
+    ("gate_proj.biases", 557_056, 32_768),
+    ("up_proj.weight", 589_824, 524_288),
+    ("up_proj.scales", 1_114_112, 32_768),
+    ("up_proj.biases", 1_146_880, 32_768),
+    ("down_proj.weight", 1_179_648, 524_288),
+    ("down_proj.scales", 1_703_936, 32_768),
+    ("down_proj.biases", 1_736_704, 32_768),
+]
+
+EXPERT_SIZE_2BIT = 983_040
+
+EXPERT_LAYOUT_2BIT = [
+    ("gate_proj.weight", 0, 262_144),
+    ("gate_proj.scales", 262_144, 32_768),
+    ("gate_proj.biases", 294_912, 32_768),
+    ("up_proj.weight", 327_680, 262_144),
+    ("up_proj.scales", 589_824, 32_768),
+    ("up_proj.biases", 622_592, 32_768),
+    ("down_proj.weight", 655_360, 262_144),
+    ("down_proj.scales", 917_504, 32_768),
+    ("down_proj.biases", 950_272, 32_768),
+]
 
 
-@dataclass(frozen=True)
-class ComponentLayout:
-    name: str
-    offset: int
-    size: int
-    dtype: str
-    shape: Tuple[int, ...]
-    logical_shape: Tuple[int, ...]
-
-
-@dataclass(frozen=True)
-class ExpertLayout:
-    quant_bits: int
-    num_experts: int
-    expert_size: int
-    components: Tuple[ComponentLayout, ...]
+class TensorRef:
+    def __init__(self, path: Path, data_start: int, name: str, meta: dict):
+        self.path = path
+        self.data_start = data_start
+        self.name = name
+        self.dtype = meta["dtype"]
+        self.shape = tuple(meta["shape"])
+        self.start, self.end = meta["data_offsets"]
 
     @property
-    def output_dir_name(self) -> str:
-        return "packed_experts" if self.quant_bits == 4 else "packed_experts_2bit"
-
-    def component(self, name: str) -> ComponentLayout:
-        for component in self.components:
-            if component.name == name:
-                return component
-        raise KeyError(name)
+    def nbytes(self) -> int:
+        return self.end - self.start
 
 
-def _dtype_name(dtype: np.dtype) -> str:
-    if dtype == np.uint32:
-        return "u32"
-    if dtype == np.uint16:
-        return "u16"
-    if dtype == np.float32:
-        return "f32"
-    raise ValueError(f"unsupported dtype {dtype!r}")
+def parse_safetensors_header(path: Path) -> Tuple[dict, int]:
+    with path.open("rb") as f:
+        header_len = struct.unpack("<Q", f.read(8))[0]
+        header = json.loads(f.read(header_len))
+    return header, 8 + header_len
 
 
-def f32_to_bf16(values: np.ndarray) -> np.ndarray:
-    arr = np.asarray(values, dtype=np.float32)
-    bits = arr.view(np.uint32)
-    rounded = bits + np.uint32(0x7FFF) + ((bits >> np.uint32(16)) & np.uint32(1))
-    return (rounded >> np.uint32(16)).astype(np.uint16)
+def scan_model(model_dir: Path) -> Dict[str, TensorRef]:
+    tensors: Dict[str, TensorRef] = {}
+    shards = sorted(model_dir.glob("model-*.safetensors"))
+    if not shards:
+        raise SystemExit(f"ERROR: no model-*.safetensors files found in {model_dir}")
+
+    for shard in shards:
+        header, data_start = parse_safetensors_header(shard)
+        for name, meta in header.items():
+            if name == "__metadata__":
+                continue
+            tensors[name] = TensorRef(shard, data_start, name, meta)
+    return tensors
 
 
-def bf16_to_f32(values: np.ndarray) -> np.ndarray:
-    arr = np.asarray(values)
-    if arr.dtype == np.float32:
-        return arr.astype(np.float32, copy=False)
-    if str(arr.dtype) == "bfloat16":
-        return arr.astype(np.float32, copy=False)
-    if arr.dtype != np.uint16:
-        arr = arr.astype(np.uint16, copy=False)
-    return (arr.astype(np.uint32) << np.uint32(16)).view(np.float32)
+def sanitize_name(name: str) -> str:
+    if name.startswith("model.language_model."):
+        name = "model." + name[len("model.language_model."):]
+    elif name.startswith("language_model."):
+        name = name[len("language_model."):]
+    if name == "model.lm_head.weight":
+        name = "lm_head.weight"
+    return name
 
 
-def _pack_words(values: np.ndarray, bits: int) -> np.ndarray:
-    values_per_word = 32 // bits
-    if values.shape[-1] != values_per_word:
-        raise ValueError(
-            f"expected {values_per_word} values per word for {bits}-bit packing, "
-            f"got {values.shape[-1]}"
-        )
-    packed = np.zeros(values.shape[:-1], dtype=np.uint32)
-    shifts = [np.uint32(i * bits) for i in range(values_per_word)]
-    for idx, shift in enumerate(shifts):
-        packed |= values[..., idx].astype(np.uint32) << shift
-    return packed
+def is_language_tensor(name: str) -> bool:
+    return name.startswith("model.language_model.") or name.startswith("lm_head.")
 
 
-def _unpack_words(values: np.ndarray, bits: int) -> np.ndarray:
-    values_per_word = 32 // bits
-    mask = np.uint32((1 << bits) - 1)
-    words = np.asarray(values, dtype=np.uint32)
-    unpacked = np.empty(words.shape + (values_per_word,), dtype=np.uint32)
-    for idx in range(values_per_word):
-        unpacked[..., idx] = (words >> np.uint32(idx * bits)) & mask
-    return unpacked
+def is_expert_tensor(name: str) -> bool:
+    return ".mlp.experts." in name
 
 
-def _quantize_rowwise(matrix: np.ndarray, bits: int, group_size: int = GROUP_SIZE) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    if bits not in (Q4_BITS, Q2_BITS):
-        raise ValueError(f"unsupported quantization bits: {bits}")
+def is_visual_tensor(name: str) -> bool:
+    return name.startswith("model.visual.") or name.startswith("vision_tower.")
 
-    arr = np.asarray(matrix, dtype=np.float32, order="C")
-    if arr.ndim != 2:
-        raise ValueError(f"expected 2D matrix, got shape {arr.shape}")
-    rows, cols = arr.shape
-    if cols % group_size != 0:
-        raise ValueError(f"column count {cols} is not divisible by group size {group_size}")
 
-    values_per_word = 32 // bits
-    if cols % values_per_word != 0:
-        raise ValueError(f"column count {cols} is not divisible by {values_per_word}")
+def read_tensor(ref: TensorRef) -> np.ndarray:
+    if ref.dtype != "BF16":
+        raise ValueError(f"{ref.name}: expected BF16, got {ref.dtype}")
+    with ref.path.open("rb") as f:
+        f.seek(ref.data_start + ref.start)
+        raw = f.read(ref.nbytes)
+    return np.frombuffer(raw, dtype="<u2").copy().reshape(ref.shape)
 
-    groups = cols // group_size
-    reshaped = arr.reshape(rows, groups, group_size)
-    mn = reshaped.min(axis=-1)
-    mx = reshaped.max(axis=-1)
-    scale = (mx - mn) / float((1 << bits) - 1)
+
+def read_bf16_rows(ref: TensorRef, row_start: int, row_count: int) -> np.ndarray:
+    if ref.dtype != "BF16" or len(ref.shape) != 2:
+        raise ValueError(f"{ref.name}: expected 2D BF16")
+    rows, cols = ref.shape
+    if row_start < 0 or row_start + row_count > rows:
+        raise ValueError(f"{ref.name}: row slice out of range")
+    row_bytes = cols * 2
+    with ref.path.open("rb") as f:
+        f.seek(ref.data_start + ref.start + row_start * row_bytes)
+        raw = f.read(row_count * row_bytes)
+    return np.frombuffer(raw, dtype="<u2").copy().reshape(row_count, cols)
+
+
+def bf16_to_f32(x: np.ndarray) -> np.ndarray:
+    return (x.astype(np.uint32) << 16).view(np.float32)
+
+
+def f32_to_bf16(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float32)
+    u = x.view(np.uint32)
+    rounded = u + 0x7FFF + ((u >> 16) & 1)
+    return (rounded >> 16).astype(np.uint16)
+
+
+def pack_2bit(vals: np.ndarray) -> np.ndarray:
+    assert vals.shape[-1] % 16 == 0
+    flat = vals.reshape(-1, vals.shape[-1])
+    out = np.zeros((flat.shape[0], flat.shape[1] // 16), dtype=np.uint32)
+    for i in range(16):
+        out |= flat[:, i::16].astype(np.uint32) << (i * 2)
+    return out.reshape(vals.shape[:-1] + (vals.shape[-1] // 16,))
+
+
+def quantize_rows_bf16_2bit(rows_bf16: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    rows_f32 = bf16_to_f32(rows_bf16)
+    rows, in_dim = rows_f32.shape
+    if in_dim % GROUP_SIZE != 0:
+        raise ValueError(f"in_dim {in_dim} is not divisible by group size {GROUP_SIZE}")
+    groups = in_dim // GROUP_SIZE
+    grouped = rows_f32.reshape(rows, groups, GROUP_SIZE)
+    mn = grouped.min(axis=2, keepdims=True)
+    mx = grouped.max(axis=2, keepdims=True)
+    scale = (mx - mn) / 3.0
     safe_scale = np.where(scale == 0.0, 1.0, scale)
-
-    q = np.rint((reshaped - mn[..., None]) / safe_scale[..., None]).astype(np.int32)
-    np.clip(q, 0, (1 << bits) - 1, out=q)
-    q = q.astype(np.uint32, copy=False)
-    packed = _pack_words(q.reshape(rows, cols // values_per_word, values_per_word), bits)
-    return packed, f32_to_bf16(scale), f32_to_bf16(mn)
-
-
-def _dequantize_rowwise(
-    packed: np.ndarray,
-    scales_bf16: np.ndarray,
-    biases_bf16: np.ndarray,
-    bits: int,
-    group_size: int = GROUP_SIZE,
-) -> np.ndarray:
-    if bits not in (Q4_BITS, Q2_BITS):
-        raise ValueError(f"unsupported quantization bits: {bits}")
-
-    packed = np.asarray(packed, dtype=np.uint32, order="C")
-    rows, packed_cols = packed.shape
-    values_per_word = 32 // bits
-    if packed_cols % (group_size // values_per_word) != 0:
-        raise ValueError("packed shape does not match group layout")
-
-    unpacked = _unpack_words(packed, bits).reshape(rows, packed_cols * values_per_word)
-    scale = bf16_to_f32(scales_bf16).astype(np.float32, copy=False)
-    bias = bf16_to_f32(biases_bf16).astype(np.float32, copy=False)
-    groups = scale.shape[1]
-    dequantized = (unpacked.reshape(rows, groups, group_size).astype(np.float32) * scale[..., None]) + bias[..., None]
-    return dequantized.reshape(rows, groups * group_size)
+    q = np.rint((grouped - mn) / safe_scale)
+    q = np.clip(q, 0, 3).astype(np.uint8).reshape(rows, in_dim)
+    packed = pack_2bit(q)
+    scales = f32_to_bf16(scale.squeeze(2))
+    biases = f32_to_bf16(mn.squeeze(2))
+    return packed, scales, biases
 
 
-def layout_for_bits(bits: int, num_experts: int = NUM_EXPERTS) -> ExpertLayout:
-    if bits not in (Q4_BITS, Q2_BITS):
-        raise ValueError(f"unsupported quantization bits: {bits}")
-
-    values_per_word = 32 // bits
-    packed_gate_cols = GATE_COLS // values_per_word
-    packed_down_cols = DOWN_COLS // values_per_word
-    group_cols = GATE_COLS // GROUP_SIZE
-    down_group_cols = DOWN_COLS // GROUP_SIZE
-
-    components: List[ComponentLayout] = []
-    offset = 0
-
-    def add(name: str, rows: int, logical_cols: int, dtype: np.dtype, shape: Tuple[int, ...]) -> None:
-        nonlocal offset
-        size = int(np.prod(shape)) * np.dtype(dtype).itemsize
-        components.append(
-            ComponentLayout(
-                name=name,
-                offset=offset,
-                size=size,
-                dtype=_dtype_name(np.dtype(dtype)),
-                shape=shape,
-                logical_shape=(rows, logical_cols),
-            )
-        )
-        offset += size
-
-    add("gate_proj.weight", GATE_ROWS, GATE_COLS, np.uint32, (GATE_ROWS, packed_gate_cols))
-    add("gate_proj.scales", GATE_ROWS, GATE_COLS, np.uint16, (GATE_ROWS, group_cols))
-    add("gate_proj.biases", GATE_ROWS, GATE_COLS, np.uint16, (GATE_ROWS, group_cols))
-    add("up_proj.weight", UP_ROWS, UP_COLS, np.uint32, (UP_ROWS, packed_gate_cols))
-    add("up_proj.scales", UP_ROWS, UP_COLS, np.uint16, (UP_ROWS, group_cols))
-    add("up_proj.biases", UP_ROWS, UP_COLS, np.uint16, (UP_ROWS, group_cols))
-    add("down_proj.weight", DOWN_ROWS, DOWN_COLS, np.uint32, (DOWN_ROWS, packed_down_cols))
-    add("down_proj.scales", DOWN_ROWS, DOWN_COLS, np.uint16, (DOWN_ROWS, down_group_cols))
-    add("down_proj.biases", DOWN_ROWS, DOWN_COLS, np.uint16, (DOWN_ROWS, down_group_cols))
-
-    return ExpertLayout(bits, num_experts, offset, tuple(components))
+def pack_4bit(vals: np.ndarray) -> np.ndarray:
+    assert vals.shape[-1] % 8 == 0
+    flat = vals.reshape(-1, vals.shape[-1])
+    out = np.zeros((flat.shape[0], flat.shape[1] // 8), dtype=np.uint32)
+    for i in range(8):
+        out |= flat[:, i::8].astype(np.uint32) << (i * 4)
+    return out.reshape(vals.shape[:-1] + (vals.shape[-1] // 8,))
 
 
-def layout_to_json(layout: ExpertLayout) -> Dict[str, object]:
-    return {
-        "schema_version": 1,
-        "quant": f"q{layout.quant_bits}",
-        "bits": layout.quant_bits,
-        "group_size": GROUP_SIZE,
-        "num_experts": layout.num_experts,
-        "expert_size": layout.expert_size,
-        "active_expert_size": layout.expert_size,
-        "components": [
-            {
-                "name": c.name,
-                "offset": c.offset,
-                "size": c.size,
-                "dtype": c.dtype,
-                "shape": list(c.shape),
-                "logical_shape": list(c.logical_shape),
-            }
-            for c in layout.components
-        ],
+def quantize_rows_bf16(rows_bf16: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    rows_f32 = bf16_to_f32(rows_bf16)
+    rows, in_dim = rows_f32.shape
+    if in_dim % GROUP_SIZE != 0:
+        raise ValueError(f"in_dim {in_dim} is not divisible by group size {GROUP_SIZE}")
+    groups = in_dim // GROUP_SIZE
+    grouped = rows_f32.reshape(rows, groups, GROUP_SIZE)
+    mn = grouped.min(axis=2, keepdims=True)
+    mx = grouped.max(axis=2, keepdims=True)
+    scale = (mx - mn) / 15.0
+    safe_scale = np.where(scale == 0.0, 1.0, scale)
+    q = np.rint((grouped - mn) / safe_scale)
+    q = np.clip(q, 0, 15).astype(np.uint8).reshape(rows, in_dim)
+    packed = pack_4bit(q)
+    scales = f32_to_bf16(scale.squeeze(2))
+    biases = f32_to_bf16(mn.squeeze(2))
+    return packed, scales, biases
+
+
+def align_file(f, offset: int, align: int = 64) -> int:
+    pad = (-offset) % align
+    if pad:
+        f.write(b"\0" * pad)
+        offset += pad
+    return offset
+
+
+def write_blob(f, manifest: dict, name: str, data: np.ndarray, dtype: str, offset: int) -> int:
+    offset = align_file(f, offset)
+    raw = data.tobytes(order="C")
+    f.write(raw)
+    manifest["tensors"][name] = {
+        "offset": offset,
+        "size": len(raw),
+        "shape": list(data.shape),
+        "dtype": dtype,
+    }
+    return offset + len(raw)
+
+
+def quantize_matrix_to_weights(
+    ref: TensorRef,
+    out_f,
+    manifest: dict,
+    base_name: str,
+    offset: int,
+    row_chunk: int,
+) -> int:
+    rows, cols = ref.shape
+    if cols % GROUP_SIZE != 0:
+        raise ValueError(f"{ref.name}: cols={cols} not divisible by {GROUP_SIZE}")
+
+    packed_parts: List[np.ndarray] = []
+    scale_parts: List[np.ndarray] = []
+    bias_parts: List[np.ndarray] = []
+    for r0 in range(0, rows, row_chunk):
+        n = min(row_chunk, rows - r0)
+        packed, scales, biases = quantize_rows_bf16(read_bf16_rows(ref, r0, n))
+        packed_parts.append(packed)
+        scale_parts.append(scales)
+        bias_parts.append(biases)
+
+    packed_all = np.concatenate(packed_parts, axis=0)
+    scales_all = np.concatenate(scale_parts, axis=0)
+    biases_all = np.concatenate(bias_parts, axis=0)
+    offset = write_blob(out_f, manifest, base_name + ".weight", packed_all, "U32", offset)
+    offset = write_blob(out_f, manifest, base_name + ".scales", scales_all, "BF16", offset)
+    offset = write_blob(out_f, manifest, base_name + ".biases", biases_all, "BF16", offset)
+    return offset
+
+
+def export_model_weights(tensors: Dict[str, TensorRef], output_dir: Path, row_chunk: int) -> None:
+    bin_path = output_dir / "model_weights.bin"
+    json_path = output_dir / "model_weights.json"
+    manifest = {
+        "model": "Qwen3.6-35B-A3B",
+        "num_tensors": 0,
+        "config": {
+            "hidden_size": HIDDEN_DIM,
+            "num_hidden_layers": NUM_LAYERS,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 2,
+            "head_dim": 256,
+            "vocab_size": VOCAB_SIZE,
+            "rms_norm_eps": 1e-6,
+            "num_experts": NUM_EXPERTS,
+            "num_experts_per_tok": 8,
+            "moe_intermediate_size": MOE_INTERMEDIATE,
+            "shared_expert_intermediate_size": MOE_INTERMEDIATE,
+            "full_attention_interval": 4,
+            "linear_num_value_heads": 32,
+            "linear_num_key_heads": 16,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128,
+            "linear_conv_kernel_dim": 4,
+            "partial_rotary_factor": 0.25,
+            "rope_theta": 10000000.0,
+        },
+        "tensors": {},
     }
 
-
-def write_layout_json(path: Path, layout: ExpertLayout) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as fh:
-        json.dump(layout_to_json(layout), fh, indent=2, sort_keys=False)
-        fh.write("\n")
-
-
-def load_layout_json(path: Path) -> ExpertLayout:
-    with Path(path).open("r", encoding="utf-8") as fh:
-        data = json.load(fh)
-    bits = int(data.get("bits") or str(data.get("quant", "q4")).lstrip("q"))
-    num_experts = int(data.get("num_experts", NUM_EXPERTS))
-    components = []
-    for item in data.get("components", []):
-        shape = tuple(int(x) for x in item["shape"])
-        logical_shape = tuple(int(x) for x in item.get("logical_shape", shape))
-        components.append(
-            ComponentLayout(
-                name=str(item["name"]),
-                offset=int(item["offset"]),
-                size=int(item["size"]),
-                dtype=str(item["dtype"]),
-                shape=shape,
-                logical_shape=logical_shape,
-            )
-        )
-    expert_size = int(data.get("expert_size", sum(component.size for component in components)))
-    return ExpertLayout(bits, num_experts, expert_size, tuple(components))
-
-
-class TensorStore:
-    def __init__(self, model_dir: Path):
-        self.model_dir = Path(model_dir)
-        self._handles: Dict[Path, object] = {}
-        self._key_cache: Dict[Path, set] = {}
-        self._weight_map: Dict[str, str] = self._load_weight_map()
-        self._shards = self._discover_shards()
-
-    def close(self) -> None:
-        self._handles.clear()
-        self._key_cache.clear()
-
-    def __enter__(self) -> "TensorStore":
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        self.close()
-
-    def _load_weight_map(self) -> Dict[str, str]:
-        index_candidates = sorted(self.model_dir.glob("*.safetensors.index.json"))
-        if not index_candidates:
-            index_candidates = sorted(self.model_dir.glob("*.index.json"))
-        if not index_candidates:
-            return {}
-        with index_candidates[0].open("r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        weight_map = data.get("weight_map", {})
-        if not isinstance(weight_map, dict):
-            raise TypeError(f"weight_map in {index_candidates[0]} is not a dict")
-        return {str(k): str(v) for k, v in weight_map.items()}
-
-    def _discover_shards(self) -> List[Path]:
-        if self._weight_map:
-            return sorted({self.model_dir / shard for shard in self._weight_map.values()})
-        return sorted(self.model_dir.glob("*.safetensors"))
-
-    def _open_handle(self, shard: Path):
-        handle = self._handles.get(shard)
-        if handle is not None:
-            return handle
-        try:
-            handle = safe_open(str(shard), framework="numpy")
-        except TypeError:
-            handle = safe_open(str(shard), framework="np")
-        self._handles[shard] = handle
-        try:
-            self._key_cache[shard] = set(handle.keys())
-        except Exception:
-            self._key_cache[shard] = set()
-        return handle
-
-    def _resolve_shard(self, tensor_name: str) -> Path:
-        mapped = self._weight_map.get(tensor_name)
-        if mapped is not None:
-            shard = self.model_dir / mapped
-            if not shard.exists():
-                raise FileNotFoundError(shard)
-            return shard
-        for shard in self._shards:
-            keys = self._key_cache.get(shard)
-            if keys is not None and tensor_name in keys:
-                return shard
-            handle = self._open_handle(shard)
-            keys = self._key_cache.get(shard, set())
-            if tensor_name in keys:
-                return shard
-        raise KeyError(tensor_name)
-
-    def get(self, tensor_name: str) -> np.ndarray:
-        shard = self._resolve_shard(tensor_name)
-        handle = self._open_handle(shard)
-        array = handle.get_tensor(tensor_name)
-        return np.asarray(array)
-
-
-def _candidate_tensor_names(layer: int, expert: int, role: str) -> Iterator[str]:
-    aliases = ROLE_ALIASES[role]
-    prefixes = (
-        f"model.layers.{layer}.mlp.experts.{expert}",
-        f"model.layers.{layer}.block_sparse_moe.experts.{expert}",
-        f"model.layers.{layer}.mlp.expert.{expert}",
-    )
-    for prefix in prefixes:
-        for alias in aliases:
-            yield f"{prefix}.{alias}.weight"
-            yield f"{prefix}.{alias}"
-
-
-def _load_expert_matrix(store: TensorStore, layer: int, expert: int, role: str) -> np.ndarray:
-    expected = ROLE_SHAPES[role]
-    candidates = tuple(_candidate_tensor_names(layer, expert, role))
-    last_error: Optional[BaseException] = None
-    for name in candidates:
-        try:
-            tensor = store.get(name)
-        except Exception as exc:
-            last_error = exc
+    selected = []
+    for name, ref in tensors.items():
+        if is_visual_tensor(name) or is_expert_tensor(name) or not is_language_tensor(name):
             continue
+        san = sanitize_name(name)
+        selected.append((san, ref))
+    selected.sort(key=lambda x: x[0])
 
-        arr = _to_float32(tensor)
-        if arr.shape == expected:
-            return arr
-        if arr.shape == expected[::-1]:
-            return np.asarray(arr.T, dtype=np.float32, order="C")
-        if arr.ndim == 1 and arr.size == expected[0] * expected[1]:
-            return np.asarray(arr.reshape(expected), dtype=np.float32, order="C")
-        last_error = ValueError(
-            f"tensor {name} has shape {arr.shape}, expected {expected} or {expected[::-1]}"
-        )
-    raise KeyError(
-        f"could not find a tensor for layer={layer} expert={expert} role={role}: "
-        f"{', '.join(candidates)}"
-    ) from last_error
+    print(f"[weights] exporting {len(selected)} non-expert tensors")
+    offset = 0
+    t0 = time.time()
+    with bin_path.open("wb") as out_f:
+        for i, (san, ref) in enumerate(selected, 1):
+            if ref.dtype != "BF16":
+                raise ValueError(f"{ref.name}: unsupported dtype {ref.dtype}")
 
+            if len(ref.shape) == 2 and san.endswith(".weight"):
+                base = san[:-len(".weight")]
+                offset = quantize_matrix_to_weights(ref, out_f, manifest, base, offset, row_chunk)
+            elif san.endswith(".linear_attn.A_log"):
+                data = bf16_to_f32(read_tensor(ref))
+                offset = write_blob(out_f, manifest, san, data, "F32", offset)
+            else:
+                data = read_tensor(ref)
+                offset = write_blob(out_f, manifest, san, data, "BF16", offset)
 
-def _to_float32(array: np.ndarray) -> np.ndarray:
-    arr = np.asarray(array)
-    if arr.dtype == np.float32:
-        return arr.astype(np.float32, copy=False)
-    if arr.dtype == np.float16:
-        return arr.astype(np.float32)
-    if str(arr.dtype) == "bfloat16":
-        return arr.astype(np.float32)
-    if arr.dtype == np.uint16:
-        # Some export pipelines serialize BF16 tensors as raw uint16 payloads.
-        return bf16_to_f32(arr)
-    return arr.astype(np.float32)
+            if i % 25 == 0 or i == len(selected):
+                print(f"  [{i:4d}/{len(selected)}] {offset/1e9:.2f} GB written")
 
-
-def pack_expert_payload(
-    gate: np.ndarray,
-    up: np.ndarray,
-    down: np.ndarray,
-    bits: int,
-) -> Tuple[bytes, ExpertLayout]:
-    layout = layout_for_bits(bits)
-    sections: List[bytes] = []
-    for role, matrix in (("gate_proj", gate), ("up_proj", up), ("down_proj", down)):
-        packed, scales, biases = _quantize_rowwise(matrix, bits)
-        sections.append(np.asarray(packed, dtype=np.uint32, order="C").tobytes())
-        sections.append(np.asarray(scales, dtype=np.uint16, order="C").tobytes())
-        sections.append(np.asarray(biases, dtype=np.uint16, order="C").tobytes())
-    payload = b"".join(sections)
-    if len(payload) != layout.expert_size:
-        raise AssertionError(
-            f"packed expert size {len(payload)} does not match expected {layout.expert_size}"
-        )
-    return payload, layout
+    manifest["num_tensors"] = len(manifest["tensors"])
+    json_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    print(f"[weights] wrote {bin_path} and {json_path} in {time.time()-t0:.1f}s")
 
 
-def dequantize_expert_payload(payload: bytes, layout: ExpertLayout) -> Dict[str, np.ndarray]:
-    buf = memoryview(payload)
-    result: Dict[str, np.ndarray] = {}
-    for component in layout.components:
-        start = component.offset
-        end = start + component.size
-        raw = np.frombuffer(buf[start:end], dtype=np.uint8)
-        if component.dtype == "u32":
-            data = raw.view(np.uint32).reshape(component.shape)
-        elif component.dtype == "u16":
-            data = raw.view(np.uint16).reshape(component.shape)
+def find_required(tensors: Dict[str, TensorRef], name: str) -> TensorRef:
+    if name not in tensors:
+        raise KeyError(name)
+    return tensors[name]
+
+
+def write_expert_component(blob: bytearray, offset: int, arr: np.ndarray) -> None:
+    raw = arr.tobytes(order="C")
+    blob[offset:offset + len(raw)] = raw
+
+
+def export_packed_experts(
+    tensors: Dict[str, TensorRef],
+    output_dir: Path,
+    layers: Iterable[int],
+    bits: int = 4,
+) -> None:
+    expert_dir = output_dir / ("packed_experts" if bits == 4 else "packed_experts_2bit")
+    expert_dir.mkdir(parents=True, exist_ok=True)
+    size = EXPERT_SIZE_4BIT if bits == 4 else EXPERT_SIZE_2BIT
+    layout_data = EXPERT_LAYOUT if bits == 4 else EXPERT_LAYOUT_2BIT
+    layout = {
+        "expert_size": size,
+        "num_layers": NUM_LAYERS,
+        "num_experts": NUM_EXPERTS,
+        "components": [
+            {"name": name, "offset": off, "size": sz}
+            for name, off, sz in layout_data
+        ],
+    }
+    (expert_dir / "layout.json").write_text(json.dumps(layout, indent=2), encoding="utf-8")
+
+    for layer in layers:
+        gate_up_name = f"model.language_model.layers.{layer}.mlp.experts.gate_up_proj"
+        down_name = f"model.language_model.layers.{layer}.mlp.experts.down_proj"
+        gate_up = find_required(tensors, gate_up_name)
+        down = find_required(tensors, down_name)
+        if gate_up.shape != (NUM_EXPERTS, 2 * MOE_INTERMEDIATE, HIDDEN_DIM):
+            raise ValueError(f"{gate_up_name}: unexpected shape {gate_up.shape}")
+        if down.shape != (NUM_EXPERTS, HIDDEN_DIM, MOE_INTERMEDIATE):
+            raise ValueError(f"{down_name}: unexpected shape {down.shape}")
+
+        out_path = expert_dir / f"layer_{layer:02d}.bin"
+        print(f"[experts] layer {layer:02d} -> {out_path}")
+        t0 = time.time()
+        with out_path.open("wb") as out:
+            for expert in range(NUM_EXPERTS):
+                gu = read_bf16_rows(
+                    TensorRef(gate_up.path, gate_up.data_start, gate_up.name,
+                              {"dtype": gate_up.dtype, "shape": (NUM_EXPERTS * 2 * MOE_INTERMEDIATE, HIDDEN_DIM),
+                               "data_offsets": [gate_up.start, gate_up.end]}),
+                    expert * 2 * MOE_INTERMEDIATE,
+                    2 * MOE_INTERMEDIATE,
+                )
+                gate_bf16 = gu[:MOE_INTERMEDIATE]
+                up_bf16 = gu[MOE_INTERMEDIATE:]
+
+                d = read_bf16_rows(
+                    TensorRef(down.path, down.data_start, down.name,
+                              {"dtype": down.dtype, "shape": (NUM_EXPERTS * HIDDEN_DIM, MOE_INTERMEDIATE),
+                               "data_offsets": [down.start, down.end]}),
+                    expert * HIDDEN_DIM,
+                    HIDDEN_DIM,
+                )
+
+                if bits == 4:
+                    gate_w, gate_s, gate_b = quantize_rows_bf16(gate_bf16)
+                    up_w, up_s, up_b = quantize_rows_bf16(up_bf16)
+                    down_w, down_s, down_b = quantize_rows_bf16(d)
+                else:
+                    gate_w, gate_s, gate_b = quantize_rows_bf16_2bit(gate_bf16)
+                    up_w, up_s, up_b = quantize_rows_bf16_2bit(up_bf16)
+                    down_w, down_s, down_b = quantize_rows_bf16_2bit(d)
+
+                blob = bytearray(size)
+                for i, (w, s, b) in enumerate([(gate_w, gate_s, gate_b), (up_w, up_s, up_b), (down_w, down_s, down_b)]):
+                    write_expert_component(blob, layout_data[i*3][1], w)
+                    write_expert_component(blob, layout_data[i*3+1][1], s)
+                    write_expert_component(blob, layout_data[i*3+2][1], b)
+                out.write(blob)
+
+                if (expert + 1) % 32 == 0 or expert == NUM_EXPERTS - 1:
+                    print(f"  expert {expert+1:3d}/{NUM_EXPERTS}")
+        print(f"  done in {time.time()-t0:.1f}s, size={out_path.stat().st_size/1e9:.2f} GB")
+
+
+def build_byte_unicode_maps():
+    byte_char = {}
+    n = 0
+    for b in range(256):
+        if (0x21 <= b <= 0x7E) or (0xA1 <= b <= 0xAC) or (0xAE <= b <= 0xFF):
+            byte_char[b] = b
         else:
-            raise ValueError(component.dtype)
-        result[component.name] = np.array(data, copy=True)
-    return result
+            byte_char[b] = 256 + n
+            n += 1
+    char_byte = {cp: b for b, cp in byte_char.items()}
+    return byte_char, char_byte
 
 
-def expert_payload_to_matrices(payload: bytes, bits: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Decode a packed expert payload back to float32 matrices."""
-
-    layout = layout_for_bits(bits)
-    components = dequantize_expert_payload(payload, layout)
-    gate = _dequantize_rowwise(
-        components["gate_proj.weight"],
-        components["gate_proj.scales"],
-        components["gate_proj.biases"],
-        bits,
-    )
-    up = _dequantize_rowwise(
-        components["up_proj.weight"],
-        components["up_proj.scales"],
-        components["up_proj.biases"],
-        bits,
-    )
-    down = _dequantize_rowwise(
-        components["down_proj.weight"],
-        components["down_proj.scales"],
-        components["down_proj.biases"],
-        bits,
-    )
-    return gate, up, down
+def decode_vocab_token(token: str, char_byte: dict) -> bytes:
+    out = bytearray()
+    for ch in token:
+        cp = ord(ch)
+        if cp in char_byte:
+            out.append(char_byte[cp])
+        else:
+            out.extend(ch.encode("utf-8"))
+    return bytes(out)
 
 
-def _expert_payload_from_store(store: TensorStore, layer: int, expert: int, bits: int) -> bytes:
-    gate = _load_expert_matrix(store, layer, expert, "gate_proj")
-    up = _load_expert_matrix(store, layer, expert, "up_proj")
-    down = _load_expert_matrix(store, layer, expert, "down_proj")
-    payload, _ = pack_expert_payload(gate, up, down, bits)
-    return payload
+def split_merge_pair(pair):
+    if isinstance(pair, str):
+        parts = pair.split(" ", 1)
+        if len(parts) != 2:
+            raise ValueError(f"invalid merge rule: {pair!r}")
+        return parts[0], parts[1]
+    if len(pair) != 2:
+        raise ValueError(f"invalid merge rule: {pair!r}")
+    return pair[0], pair[1]
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as fh:
-        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def export_tokenizer_files(model_dir: Path, output_dir: Path) -> None:
+    tok_path = model_dir / "tokenizer.json"
+    if not tok_path.exists():
+        print(f"[tokenizer] {tok_path} not found; skipping tokenizer.bin/vocab.bin")
+        return
+    data = json.loads(tok_path.read_text(encoding="utf-8"))
+    model = data["model"]
+    vocab = model["vocab"]
+    merges = model["merges"]
+    added = data.get("added_tokens", [])
+
+    tokenizer_bin = output_dir / "tokenizer.bin"
+    with tokenizer_bin.open("wb") as f:
+        f.write(b"BPET")
+        f.write(struct.pack("<I", 1))
+        f.write(struct.pack("<I", len(vocab)))
+        f.write(struct.pack("<I", len(merges)))
+        f.write(struct.pack("<I", len(added)))
+        for token, token_id in sorted(vocab.items(), key=lambda kv: kv[1]):
+            b = token.encode("utf-8")
+            f.write(struct.pack("<I", token_id))
+            f.write(struct.pack("<H", len(b)))
+            f.write(b)
+        for pair in merges:
+            a, b = split_merge_pair(pair)
+            ab, bb = a.encode("utf-8"), b.encode("utf-8")
+            f.write(struct.pack("<H", len(ab))); f.write(ab)
+            f.write(struct.pack("<H", len(bb))); f.write(bb)
+        for tok in added:
+            b = tok["content"].encode("utf-8")
+            f.write(struct.pack("<I", tok["id"]))
+            f.write(struct.pack("<H", len(b)))
+            f.write(b)
+
+    id_to_token = {token_id: token for token, token_id in vocab.items()}
+    for tok in added:
+        id_to_token[tok["id"]] = tok["content"]
+    max_id = max(id_to_token)
+    _, char_byte = build_byte_unicode_maps()
+    vocab_bin = output_dir / "vocab.bin"
+    with vocab_bin.open("wb") as f:
+        f.write(struct.pack("<II", max_id + 1, max_id))
+        for token_id in range(max_id + 1):
+            token = id_to_token.get(token_id, "")
+            if token.startswith("<|") and token.endswith("|>"):
+                b = token.encode("utf-8")
+            else:
+                b = decode_vocab_token(token, char_byte)
+            f.write(struct.pack("<H", min(len(b), 65535)))
+            f.write(b[:65535])
+    print(f"[tokenizer] wrote {tokenizer_bin} and {vocab_bin}")
 
 
-def _write_layer_file(
-    store: TensorStore,
-    layer: int,
-    out_path: Path,
-    bits: int,
-    num_experts: int = NUM_EXPERTS,
-    force: bool = False,
-) -> ExpertLayout:
-    if out_path.exists() and not force:
-        raise FileExistsError(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    layout = layout_for_bits(bits, num_experts=num_experts)
-    with out_path.open("wb") as fh:
-        for expert in range(num_experts):
-            payload = _expert_payload_from_store(store, layer, expert, bits)
-            fh.write(payload)
-    if out_path.stat().st_size != layout.expert_size * num_experts:
-        raise AssertionError(
-            f"{out_path} has size {out_path.stat().st_size}, expected {layout.expert_size * num_experts}"
-        )
-    return layout
+def parse_layers(spec: str | None) -> List[int]:
+    if not spec or spec == "all":
+        return list(range(NUM_LAYERS))
+    out = []
+    for part in spec.split(","):
+        part = part.strip()
+        if "-" in part:
+            a, b = part.split("-", 1)
+            out.extend(range(int(a), int(b) + 1))
+        else:
+            out.append(int(part))
+    return sorted(set(out))
 
 
-def convert_model(
-    model_dir: Path,
-    output_root: Path,
-    bits: int,
-    num_layers: int = NUM_LAYERS,
-    num_experts: int = NUM_EXPERTS,
-    force: bool = False,
-) -> Path:
-    model_dir = Path(model_dir)
-    output_root = Path(output_root)
-    layout = layout_for_bits(bits, num_experts=num_experts)
-    out_dir = output_root / layout.output_dir_name
-    if out_dir.exists() and not force:
-        raise FileExistsError(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    with TensorStore(model_dir) as store:
-        for layer in range(num_layers):
-            layer_name = f"layer_{layer:02d}.bin"
-            layer_path = out_dir / layer_name
-            _write_layer_file(store, layer, layer_path, bits, num_experts=num_experts, force=force)
-    write_layout_json(out_dir / "layout.json", layout)
-    return out_dir
+def check_download_complete(model_dir: Path) -> bool:
+    shards = sorted(model_dir.glob("model-*.safetensors"))
+    complete = True
+    if len(shards) != 26:
+        print(f"[check] WARNING: found {len(shards)}/26 safetensors shards; download is not complete yet")
+        complete = False
+    missing = [i for i in range(1, 27) if not (model_dir / f"model-{i:05d}-of-00026.safetensors").exists()]
+    if missing:
+        print(f"[check] missing shards: {missing}")
+        complete = False
+    return complete
 
 
-def _build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Pack Qwen3.6 routed experts")
-    parser.add_argument("--model-dir", required=True, help="HF checkpoint directory with safetensors shards")
-    parser.add_argument(
-        "--output-root",
-        required=True,
-        help="Directory that will receive packed_experts/ and/or packed_experts_2bit/",
-    )
-    parser.add_argument(
-        "--quant",
-        choices=("2", "4", "both"),
-        default="4",
-        help="Expert quantization to produce",
-    )
-    parser.add_argument("--layers", type=int, default=NUM_LAYERS, help="Number of layers to pack")
-    parser.add_argument("--experts", type=int, default=NUM_EXPERTS, help="Number of experts per layer")
-    parser.add_argument("--force", action="store_true", help="Overwrite existing output directories")
-    return parser
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", "--model-dir", dest="model", default="../model/Qwen3.6-35B-A3B",
+                    help="Path to the downloaded Hugging Face model directory")
+    ap.add_argument("--output", "--output-root", dest="output", default="qwen36_35b",
+                    help="Output directory for nmoe runtime assets")
+    ap.add_argument("--layers", default="all",
+                    help='Expert layers to pack, e.g. "0", "0-3", or "all"')
+    ap.add_argument("--row-chunk", type=int, default=4096,
+                    help="Rows per quantization chunk for non-expert matrices")
+    ap.add_argument("--skip-weights", action="store_true")
+    ap.add_argument("--skip-experts", action="store_true")
+    ap.add_argument("--skip-tokenizer", action="store_true")
+    ap.add_argument("--allow-partial", action="store_true",
+                    help="Allow export even when not all 26 shards are present")
+    ap.add_argument("--bits", type=int, choices=[2, 4], default=4,
+                    help="Quantization bits for experts (2 or 4)")
+    ap.add_argument("--quant", choices=["2", "4"],
+                    help="Compatibility alias for --bits")
+    args = ap.parse_args()
+    if args.quant is not None:
+        args.bits = int(args.quant)
 
+    model_dir = Path(args.model)
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = _build_arg_parser()
-    args = parser.parse_args(argv)
+    complete = check_download_complete(model_dir)
+    if not complete and not args.allow_partial and not (args.skip_weights and args.skip_experts):
+        raise SystemExit("ERROR: download is incomplete; wait for all 26 shards or pass --allow-partial for debugging")
+    print(f"[scan] scanning {model_dir}")
+    tensors = scan_model(model_dir)
+    print(f"[scan] {len(tensors)} tensors found")
 
-    output_root = Path(args.output_root)
-    if args.quant in ("4", "both"):
-        convert_model(
-            Path(args.model_dir),
-            output_root,
-            bits=4,
-            num_layers=args.layers,
-            num_experts=args.experts,
-            force=args.force,
-        )
-    if args.quant in ("2", "both"):
-        convert_model(
-            Path(args.model_dir),
-            output_root,
-            bits=2,
-            num_layers=args.layers,
-            num_experts=args.experts,
-            force=args.force,
-        )
-    return 0
+    if not args.skip_weights:
+        export_model_weights(tensors, output_dir, args.row_chunk)
+    if not args.skip_experts:
+        export_packed_experts(tensors, output_dir, parse_layers(args.layers), bits=args.bits)
+    if not args.skip_tokenizer:
+        export_tokenizer_files(model_dir, output_dir)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

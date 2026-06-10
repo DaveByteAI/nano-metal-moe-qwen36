@@ -17,9 +17,11 @@ this setup practical on a 16GB machine.
 - `ask`, `chat`, and `bench` commands
 - Support for q4 and q2 routed expert packs
 - Metal kernels for the runtime hot path
-- A Python converter for Hugging Face safetensors expert weights
+- A Python converter for Hugging Face safetensors into the runtime package
 
-Model weights are not part of this repository.
+Model weights are not part of this repository. This repo expects a converted
+runtime package made from the Hugging Face checkpoint
+`Qwen/Qwen3.6-35B-A3B`.
 
 ## Build
 
@@ -31,7 +33,9 @@ The binary is written to `./nmoe`.
 
 ## Model Layout
 
-By default the runtime looks for `qwen36_35b/`:
+By default the runtime looks for `qwen36_35b/`. In this working copy that path
+may be a symlink to another converted package; for a fresh checkout you can
+either create the directory directly or symlink it yourself.
 
 ```text
 qwen36_35b/
@@ -53,6 +57,69 @@ You can also pass a model directory explicitly:
 ./nmoe ask "你好" --model /path/to/qwen36_35b
 ```
 
+## Download And Convert The Model
+
+Use the official Hugging Face model:
+
+- Model repo: `Qwen/Qwen3.6-35B-A3B`
+- Runtime package name used by this repo: `qwen36_35b`
+- The converter expects the original BF16 `model-*.safetensors` shards plus
+  `tokenizer.json`.
+
+Install the download/conversion dependencies:
+
+```bash
+python3 -m pip install -U huggingface_hub numpy
+```
+
+Download the HF checkpoint. The model is large, so keep it outside git:
+
+```bash
+mkdir -p ../model
+hf download Qwen/Qwen3.6-35B-A3B \
+  --local-dir ../model/Qwen3.6-35B-A3B
+```
+
+If your `huggingface_hub` install does not provide the `hf` command, use:
+
+```bash
+huggingface-cli download Qwen/Qwen3.6-35B-A3B \
+  --local-dir ../model/Qwen3.6-35B-A3B
+```
+
+Convert the downloaded checkpoint into the runtime layout:
+
+```bash
+python3 scripts/convert_qwen36.py \
+  --model ../model/Qwen3.6-35B-A3B \
+  --output qwen36_35b \
+  --bits 4
+```
+
+That command writes:
+
+- `model_weights.bin` and `model_weights.json` for non-expert tensors
+- `tokenizer.bin` and `vocab.bin`
+- `packed_experts/` for q4 routed experts
+
+To additionally create q2 experts, reuse the already generated shared weights
+and tokenizer files:
+
+```bash
+python3 scripts/convert_qwen36.py \
+  --model ../model/Qwen3.6-35B-A3B \
+  --output qwen36_35b \
+  --bits 2 \
+  --skip-weights \
+  --skip-tokenizer
+```
+
+If you already have a converted package elsewhere, symlink it:
+
+```bash
+ln -s /path/to/qwen36_35b qwen36_35b
+```
+
 ## Run
 
 ```bash
@@ -72,23 +139,26 @@ Useful options:
 - `--timing`: print runtime timing
 - `--quiet`: suppress token streaming
 
-## Convert Experts
+## Convert Experts Only
 
-The converter writes `packed_experts/` for q4 or `packed_experts_2bit/` for q2:
+For expert-only refreshes, skip the shared weights and tokenizer. This is useful
+when `model_weights.bin`, `model_weights.json`, `tokenizer.bin`, and `vocab.bin`
+already exist:
 
 ```bash
 python3 scripts/convert_qwen36.py \
-  --model-dir /path/to/Qwen3.6-35B-A3B \
-  --output-root qwen36_35b \
-  --quant 4
+  --model ../model/Qwen3.6-35B-A3B \
+  --output qwen36_35b \
+  --bits 4 \
+  --skip-weights \
+  --skip-tokenizer
 
 python3 scripts/convert_qwen36.py \
-  --model-dir /path/to/Qwen3.6-35B-A3B \
-  --output-root qwen36_35b \
-  --quant 2
+  --model ../model/Qwen3.6-35B-A3B \
+  --output qwen36_35b \
+  --bits 2 \
+  --skip-weights \
+  --skip-tokenizer
 ```
 
-Use `--quant both` to generate both directories in one run. Add `--force` if the
-output directory already exists and should be overwritten.
-
-Python dependencies: `numpy` and `safetensors`.
+Python dependencies for downloading/conversion: `huggingface_hub` and `numpy`.

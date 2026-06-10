@@ -90,7 +90,7 @@ void nmoe_app_print_usage(const char *prog) {
             "  --prompt TEXT       prompt text for ask/bench\n"
             "  --tokens N          generation limit (ask/bench default: 256, chat: 512)\n"
             "  --experts N         active experts per layer, 1..8 (default: 8)\n"
-            "  --think N           force </think> after N tokens inside <think> (default: 1)\n"
+            "  --think N           force </think> after N thinking tokens; 0 disables (default: 1)\n"
             "  --quant auto|2|4    expert quantization selection\n"
             "  --q2 / --q4         shortcut for --quant 2|4\n"
             "  --timing            print timing summary\n"
@@ -231,7 +231,7 @@ int nmoe_app_parse(int argc, char **argv, nmoe_app_config *cfg) {
                 return -1;
             }
             if (cfg->think_budget < 0) {
-                cfg->think_budget = 0;
+                return -1;
             }
             continue;
         }
