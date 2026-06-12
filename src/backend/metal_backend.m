@@ -44,6 +44,8 @@ static NSString *const kNMOEKernelNames[NMOE_BACKEND_KERNEL_COUNT] = {
     @"nmoe_lm_head_argmax_q4",
     @"nmoe_lm_head_argmax_reduce",
     @"nmoe_full_qk_prep",
+    @"nmoe_linear_proj_q4",
+    @"nmoe_attn_decode_fused",
 };
 
 static NSString *const kNMOEWeightBufferLabel = @"model_weights";

@@ -5,6 +5,7 @@
 #include "nmoe/math.h"
 
 #include <fcntl.h>
+#include <mach/mach_time.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -47,6 +48,7 @@ static const uint32_t kNMOEThinkStart = 248068;
 static const uint32_t kNMOEThinkEnd = 248069;
 
 static double NMOENowSeconds(void);
+static double NMOEHostSeconds(void);
 static BOOL NMOEUseRoutedExperts(void);
 static uint32_t NMOEExpertRowsPerThreadgroup(id<MTLComputePipelineState> pipeline);
 static uint32_t NMOEMatvecRowsPerThreadgroup(id<MTLComputePipelineState> pipeline);
@@ -57,6 +59,11 @@ typedef struct {
     double expertFetch;
     double expert;
     double contextSync;
+    double contextGpu;
+    double contextDriver; /* cmdbuf kernelStart..kernelEnd (driver CPU prep) */
+    double contextQueue;  /* cmdbuf kernelEnd..GPUStart (waiting for GPU)   */
+    double contextCommitLag; /* commit..kernelStart */
+    double contextEndLag;    /* GPUEnd..waitUntilCompleted return */
     double deferredWait;
     double total;
     size_t layerCount;
@@ -106,11 +113,31 @@ static NMOEDeferredExpertState g_deferredExperts = {
     .cmdExperts = nil,
 };
 
+static double g_deferredExpertGpuTotal = 0.0;
+static double g_deferredExpertQueueTotal = 0.0;
+static size_t g_deferredExpertGpuCount = 0;
+
+// --- Pipelined expert phase (SharedEvent) ---
+// The expert kernels are pre-encoded into the per-layer command buffer, gated
+// on g_expertDataEvent. The GPU signals g_expertRouteEvent once router scores
+// are written; the CPU waits on that (never on buffer completion), runs top-k,
+// preads the selected experts into the fixed IO buffers, fills the params
+// buffer, then signals g_expertDataEvent to release the GPU.
+static id<MTLSharedEvent> g_expertRouteEvent = nil;
+static id<MTLSharedEvent> g_expertDataEvent = nil;
+static uint64_t g_expertEventValue = 0; // g_expertRouteEvent values
+static uint64_t g_expertDataValue = 0;  // g_expertDataEvent values (2 per layer: gate+up wave, down wave)
+static void *g_expertParamsBuf = nil; // 16 floats: [0..7]=expert weights, [8]=shared gate raw score
+
 static void NMOEFinalizeDeferredExperts(nmoe_runtime *rt) {
     (void)rt;
     if (!g_deferredExperts.active) return;
     if (g_deferredExperts.cmdExperts != nil) {
         [g_deferredExperts.cmdExperts waitUntilCompleted];
+        id<MTLCommandBuffer> dc = g_deferredExperts.cmdExperts;
+        g_deferredExpertGpuTotal += dc.GPUEndTime - dc.GPUStartTime;
+        g_deferredExpertQueueTotal += dc.GPUStartTime - dc.kernelEndTime;
+        g_deferredExpertGpuCount += 1;
     }
     g_deferredExperts.active = NO;
     g_deferredExperts.gpuCombined = NO;
@@ -122,6 +149,7 @@ static void NMOEFinalizeDeferredExperts(nmoe_runtime *rt) {
     }
 }
 
+static void NMOECancelDeferredExperts(void) __attribute__((unused));
 static void NMOECancelDeferredExperts(void) {
     g_deferredExperts.active = NO;
     g_deferredExperts.gpuCombined = NO;
@@ -442,6 +470,21 @@ typedef struct {
     uint32_t rows_per_tg;
 } NMOERouteSharedQ4Args;
 
+typedef struct {
+    uint32_t qkv_rows;
+    uint32_t z_rows;
+    uint32_t beta_rows;
+    uint32_t alpha_rows;
+    uint32_t in_dim;
+    uint32_t packed_cols;
+    uint32_t group_size;
+    uint32_t rows_per_tg;
+    uint32_t qkv_tgs;
+    uint32_t z_tgs;
+    uint32_t beta_tgs;
+    uint32_t alpha_tgs;
+} NMOELinearProjQ4Args;
+
 static inline float *NMOEFloatBufferAtOffset(void *buffer, size_t offsetBytes) {
     id<MTLBuffer> mtl = NMOEBridgeBuffer(buffer);
     if (mtl == nil || offsetBytes >= mtl.length) {
@@ -665,6 +708,92 @@ static BOOL NMOEEncodeDequantMatVecTensor(id<MTLCommandBuffer> cmd,
         [encoder setBuffer:inputMTL offset:inputOffset atIndex:3];
         [encoder setBuffer:outputMTL offset:outputOffset atIndex:4];
         [encoder setBytes:&args length:sizeof(args) atIndex:5];
+    });
+}
+
+// Fused QKV + Z + Beta + Alpha dequant matvec.
+// One dispatch processes all 4 projections that share the same input.
+static BOOL NMOEEncodeLinearProjQ4(id<MTLCommandBuffer> cmd,
+                                   nmoe_runtime *rt,
+                                   const NMOEQuantTensor *qkv,
+                                   const NMOEQuantTensor *z,
+                                   const NMOEQuantTensor *beta,
+                                   const NMOEQuantTensor *alpha,
+                                   void *inputBuf, size_t inputOff,
+                                   void *qkvOut, size_t qkvOutOff,
+                                   void *zOut, size_t zOutOff,
+                                   void *betaOut, size_t betaOutOff,
+                                   void *alphaOut, size_t alphaOutOff) {
+    if (cmd == nil || rt == NULL) return NO;
+    id<MTLBuffer> wfBuf = (__bridge id<MTLBuffer>)nmoe_backend_weight_buffer(rt->backend);
+    id<MTLComputePipelineState> pipeline = (__bridge id<MTLComputePipelineState>)nmoe_backend_pipeline_state(rt->backend, NMOE_BACKEND_KERNEL_LINEAR_PROJ_Q4);
+    if (wfBuf == nil || pipeline == nil) return NO;
+
+    // Resolve tensor offsets in the weight buffer.
+    NSUInteger qkvWOff, qkvSOff, qkvBOff;
+    NSUInteger zWOff, zSOff, zBOff;
+    NSUInteger betaWOff, betaSOff, betaBOff;
+    NSUInteger alphaWOff, alphaSOff, alphaBOff;
+    if (!NMOEWeightPointerOffset(rt, qkv->weight, &qkvWOff) ||
+        !NMOEWeightPointerOffset(rt, qkv->scales, &qkvSOff) ||
+        !NMOEWeightPointerOffset(rt, qkv->biases, &qkvBOff) ||
+        !NMOEWeightPointerOffset(rt, z->weight, &zWOff) ||
+        !NMOEWeightPointerOffset(rt, z->scales, &zSOff) ||
+        !NMOEWeightPointerOffset(rt, z->biases, &zBOff) ||
+        !NMOEWeightPointerOffset(rt, beta->weight, &betaWOff) ||
+        !NMOEWeightPointerOffset(rt, beta->scales, &betaSOff) ||
+        !NMOEWeightPointerOffset(rt, beta->biases, &betaBOff) ||
+        !NMOEWeightPointerOffset(rt, alpha->weight, &alphaWOff) ||
+        !NMOEWeightPointerOffset(rt, alpha->scales, &alphaSOff) ||
+        !NMOEWeightPointerOffset(rt, alpha->biases, &alphaBOff)) return NO;
+
+    id<MTLBuffer> inMTL = NMOEBridgeBuffer(inputBuf);
+    id<MTLBuffer> qkvMTL = NMOEBridgeBuffer(qkvOut);
+    id<MTLBuffer> zMTL = NMOEBridgeBuffer(zOut);
+    id<MTLBuffer> betaMTL = NMOEBridgeBuffer(betaOut);
+    id<MTLBuffer> alphaMTL = NMOEBridgeBuffer(alphaOut);
+    if (inMTL == nil || qkvMTL == nil || zMTL == nil || betaMTL == nil || alphaMTL == nil) return NO;
+
+    uint32_t rowsPerTG = NMOEMatvecRowsPerThreadgroup(pipeline);
+    uint32_t inDim = (uint32_t)kNMOEHiddenDim;   // 2048
+    uint32_t packedCols = inDim / 8u;
+    uint32_t groupSize = 64u;
+
+    uint32_t qkvRows = 8192u, zRows = 4096u, betaRows = 32u, alphaRows = 32u;
+    uint32_t qkvTGs = (qkvRows + rowsPerTG - 1u) / rowsPerTG;
+    uint32_t zTGs = (zRows + rowsPerTG - 1u) / rowsPerTG;
+    uint32_t betaTGs = (betaRows + rowsPerTG - 1u) / rowsPerTG;
+    uint32_t alphaTGs = (alphaRows + rowsPerTG - 1u) / rowsPerTG;
+    uint32_t totalTGs = qkvTGs + zTGs + betaTGs + alphaTGs;
+
+    NMOELinearProjQ4Args args = {
+        .qkv_rows = qkvRows, .z_rows = zRows,
+        .beta_rows = betaRows, .alpha_rows = alphaRows,
+        .in_dim = inDim, .packed_cols = packedCols,
+        .group_size = groupSize, .rows_per_tg = rowsPerTG,
+        .qkv_tgs = qkvTGs, .z_tgs = zTGs,
+        .beta_tgs = betaTGs, .alpha_tgs = alphaTGs,
+    };
+
+    return NMOEEncodeKernelTG(cmd, pipeline, totalTGs, (NSUInteger)rowsPerTG * 32u, ^(id<MTLComputeCommandEncoder> encoder) {
+        [encoder setBuffer:wfBuf offset:qkvWOff atIndex:0];
+        [encoder setBuffer:wfBuf offset:qkvSOff atIndex:1];
+        [encoder setBuffer:wfBuf offset:qkvBOff atIndex:2];
+        [encoder setBuffer:wfBuf offset:zWOff atIndex:3];
+        [encoder setBuffer:wfBuf offset:zSOff atIndex:4];
+        [encoder setBuffer:wfBuf offset:zBOff atIndex:5];
+        [encoder setBuffer:wfBuf offset:betaWOff atIndex:6];
+        [encoder setBuffer:wfBuf offset:betaSOff atIndex:7];
+        [encoder setBuffer:wfBuf offset:betaBOff atIndex:8];
+        [encoder setBuffer:wfBuf offset:alphaWOff atIndex:9];
+        [encoder setBuffer:wfBuf offset:alphaSOff atIndex:10];
+        [encoder setBuffer:wfBuf offset:alphaBOff atIndex:11];
+        [encoder setBuffer:inMTL offset:inputOff atIndex:12];
+        [encoder setBuffer:qkvMTL offset:qkvOutOff atIndex:13];
+        [encoder setBuffer:zMTL offset:zOutOff atIndex:14];
+        [encoder setBuffer:betaMTL offset:betaOutOff atIndex:15];
+        [encoder setBuffer:alphaMTL offset:alphaOutOff atIndex:16];
+        [encoder setBytes:&args length:sizeof(args) atIndex:17];
     });
 }
 
@@ -1022,7 +1151,7 @@ static BOOL NMOEEncodeExpertDownCombineQ4Tensor(id<MTLCommandBuffer> cmd,
                                                 const NMOEExpertOffsets *offsets) {
     if (cmd == nil || rt == NULL || expertBuffers == NULL || count == 0 ||
         actMTL == nil || hMidBuffer == NULL || sharedActBuffer == NULL || sharedOutBuffer == NULL ||
-        hiddenOutBuffer == NULL || expertWeights == NULL || sharedDown == NULL || offsets == NULL ||
+        hiddenOutBuffer == NULL || sharedDown == NULL || offsets == NULL ||
         expertBuffers[0] == nil) return NO;
 
     id<MTLComputePipelineState> pipeline = (__bridge id<MTLComputePipelineState>)nmoe_backend_pipeline_state(rt->backend, NMOE_BACKEND_KERNEL_EXPERT_DOWN_COMBINE_Q4);
@@ -1031,7 +1160,7 @@ static BOOL NMOEEncodeExpertDownCombineQ4Tensor(id<MTLCommandBuffer> cmd,
     id<MTLBuffer> sharedMTL = NMOEBridgeBuffer(sharedOutBuffer);
     id<MTLBuffer> hiddenMTL = NMOEBridgeBuffer(hiddenOutBuffer);
     id<MTLBuffer> sharedActMTL = NMOEBridgeBuffer(sharedActBuffer);
-    id<MTLBuffer> paramsBuf = NMOEBridgeBuffer(rt->normBuffer);
+    id<MTLBuffer> paramsBuf = (__bridge id<MTLBuffer>)g_expertParamsBuf;
     NSUInteger sw = 0, ss = 0, sb = 0;
     if (pipeline == nil || weightBuffer == nil || hMidMTL == nil || sharedMTL == nil ||
         hiddenMTL == nil || sharedActMTL == nil || paramsBuf == nil ||
@@ -1039,11 +1168,15 @@ static BOOL NMOEEncodeExpertDownCombineQ4Tensor(id<MTLCommandBuffer> cmd,
         !NMOEWeightPointerOffset(rt, sharedDown->scales, &ss) ||
         !NMOEWeightPointerOffset(rt, sharedDown->biases, &sb)) return NO;
 
-    float params[10];
-    memset(params, 0, sizeof(params));
-    for (size_t i = 0; i < count && i < 8; ++i) params[i] = expertWeights[i];
-    params[8] = sharedGateScore;
-    memcpy(paramsBuf.contents, params, sizeof(params));
+    // In pipelined mode (expertWeights == NULL) the CPU fills the params buffer
+    // during the service window; in legacy synchronous mode fill it here.
+    if (expertWeights != NULL) {
+        float params[16];
+        memset(params, 0, sizeof(params));
+        for (size_t i = 0; i < count && i < 8; ++i) params[i] = expertWeights[i];
+        params[8] = sharedGateScore;
+        memcpy(paramsBuf.contents, params, sizeof(params));
+    }
 
     NMOEExpertBatchedArgs args = {
         .expert_count = (uint32_t)MIN(count, kNMOEMaxExperts),
@@ -1227,12 +1360,6 @@ static BOOL NMOEEncodeWeightedExpertSum(id<MTLCommandBuffer> cmd,
     id<MTLComputePipelineState> pipeline = (__bridge id<MTLComputePipelineState>)nmoe_backend_pipeline_state(rt->backend, NMOE_BACKEND_KERNEL_WEIGHTED_EXPERT_SUM);
     if (pipeline == nil) return NO;
 
-    // Pack params: 8 expert weights + shared gate score + padding
-    float params[10];
-    memset(params, 0, sizeof(params));
-    for (size_t i = 0; i < K && i < 8; i++) params[i] = expertWeights[i];
-    params[8] = sharedGateScore;
-
     uint32_t dim32 = (uint32_t)dim;
     uint32_t k32 = (uint32_t)K;
 
@@ -1245,10 +1372,18 @@ static BOOL NMOEEncodeWeightedExpertSum(id<MTLCommandBuffer> cmd,
     id<MTLBuffer> e6 = (__bridge id<MTLBuffer>)(K > 6 ? expertOutBuffers[6] : nil);
     id<MTLBuffer> e7 = (__bridge id<MTLBuffer>)(K > 7 ? expertOutBuffers[7] : nil);
 
-    // Use the runtime's normBuffer as a temporary params buffer
-    id<MTLBuffer> paramsBuf = NMOEBridgeBuffer(rt->normBuffer);
+    // Combine weights live in the dedicated params buffer. In pipelined mode
+    // (expertWeights == NULL) the CPU fills it during the service window; in
+    // legacy synchronous mode we fill it here at encode time.
+    id<MTLBuffer> paramsBuf = (__bridge id<MTLBuffer>)g_expertParamsBuf;
     if (paramsBuf == nil) return NO;
-    memcpy(paramsBuf.contents, params, sizeof(params));
+    if (expertWeights != NULL) {
+        float params[16];
+        memset(params, 0, sizeof(params));
+        for (size_t i = 0; i < K && i < 8; i++) params[i] = expertWeights[i];
+        params[8] = sharedGateScore;
+        memcpy(paramsBuf.contents, params, sizeof(params));
+    }
 
     return NMOEEncodeKernel(cmd, pipeline, dim, ^(id<MTLComputeCommandEncoder> encoder) {
         [encoder setBuffer:hMidMTL offset:0 atIndex:0];
@@ -1318,6 +1453,20 @@ static BOOL NMOECopyExpertsToMetalBuffers(void) {
     if (value == NULL || value[0] == '\0') return NO;
     return value[0] == '1' || value[0] == 't' || value[0] == 'T' ||
            value[0] == 'y' || value[0] == 'Y';
+}
+
+static BOOL NMOEUsePipelinedExperts(void) {
+    const char *value = getenv("NMOE_PIPELINE");
+    if (value == NULL || value[0] == '\0') return YES;
+    return !(value[0] == '0' || value[0] == 'f' || value[0] == 'F' ||
+             value[0] == 'n' || value[0] == 'N');
+}
+
+static BOOL NMOEUseFusedAttention(void) {
+    const char *value = getenv("NMOE_FUSED_ATTN");
+    if (value == NULL || value[0] == '\0') return YES;
+    return !(value[0] == '0' || value[0] == 'f' || value[0] == 'F' ||
+             value[0] == 'n' || value[0] == 'N');
 }
 
 static uint32_t NMOEExpertRowsPerThreadgroup(id<MTLComputePipelineState> pipeline) {
@@ -1426,21 +1575,31 @@ static BOOL NMOEInitExpertIOBuffers(nmoe_runtime *rt) {
     g_expertIOSharedActBuf = (__bridge_retained void *)[device newBufferWithLength:512u * sizeof(float) options:MTLResourceStorageModeShared];
     g_expertIOSharedDownBuf = (__bridge_retained void *)[device newBufferWithLength:kNMOEHiddenDim * sizeof(float) options:MTLResourceStorageModeShared];
     g_expertIOExpertActBuf = (__bridge_retained void *)[device newBufferWithLength:kNMOEMaxExperts * 512u * sizeof(float) options:MTLResourceStorageModeShared];
+    if (g_expertParamsBuf == NULL) {
+        g_expertParamsBuf = (__bridge_retained void *)[device newBufferWithLength:16u * sizeof(float) options:MTLResourceStorageModeShared];
+    }
+    if (g_expertRouteEvent == nil) g_expertRouteEvent = [device newSharedEvent];
+    if (g_expertDataEvent == nil) g_expertDataEvent = [device newSharedEvent];
     return YES;
 }
 
-// Async parallel pread experts directly into pre-allocated Metal buffers
-static BOOL NMOEAsyncReadExperts(int fd, const uint8_t *mmapBase,
-                                  const size_t *indices, size_t count,
-                                  void **buffers, int *outValid) {
+// Async parallel pread of a byte range of each selected expert into the
+// pre-allocated Metal buffers. rangeLen == 0 means "the whole expert".
+static BOOL NMOEAsyncReadExpertsRange(int fd, const uint8_t *mmapBase,
+                                      const size_t *indices, size_t count,
+                                      void **buffers, int *outValid,
+                                      size_t rangeStart, size_t rangeLen) {
     size_t esz = g_expertIOSize;
+    if (rangeLen == 0) rangeLen = esz;
+    if (rangeStart + rangeLen > esz) return NO;
+    const size_t readLen = rangeLen;
     dispatch_group_t group = dispatch_group_create();
     dispatch_queue_t ioQueue = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
 
     for (size_t k = 0; k < count; k++) {
         outValid[k] = 1;
         size_t expertIdx = indices[k];
-        size_t offset = expertIdx * esz;
+        size_t offset = expertIdx * esz + rangeStart;
         id<MTLBuffer> buf = (__bridge id<MTLBuffer>)buffers[k];
         if (buf == nil || buf.length < esz) {
             outValid[k] = 0;
@@ -1449,12 +1608,12 @@ static BOOL NMOEAsyncReadExperts(int fd, const uint8_t *mmapBase,
 
         if (mmapBase != NULL) {
             dispatch_group_async(group, ioQueue, ^{
-                memcpy(buf.contents, mmapBase + offset, esz);
+                memcpy((uint8_t *)buf.contents + rangeStart, mmapBase + offset, readLen);
             });
         } else {
             dispatch_group_async(group, ioQueue, ^{
-                uint8_t *dst = (uint8_t *)buf.contents;
-                size_t remaining = esz;
+                uint8_t *dst = (uint8_t *)buf.contents + rangeStart;
+                size_t remaining = readLen;
                 off_t pos = (off_t)offset;
                 while (remaining > 0) {
                     ssize_t rc = pread(fd, dst, remaining, pos);
@@ -1472,6 +1631,12 @@ static BOOL NMOEAsyncReadExperts(int fd, const uint8_t *mmapBase,
 
     dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
     return YES;
+}
+
+static BOOL NMOEAsyncReadExperts(int fd, const uint8_t *mmapBase,
+                                  const size_t *indices, size_t count,
+                                  void **buffers, int *outValid) {
+    return NMOEAsyncReadExpertsRange(fd, mmapBase, indices, count, buffers, outValid, 0, 0);
 }
 
 static BOOL NMOEWrapMappedExperts(nmoe_runtime *rt,
@@ -1975,6 +2140,13 @@ static double NMOENowSeconds(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+/* Same timebase as MTLCommandBuffer GPUStartTime/kernelStartTime (mach host time). */
+static double NMOEHostSeconds(void) {
+    static mach_timebase_info_data_t tb;
+    if (tb.denom == 0) mach_timebase_info(&tb);
+    return (double)mach_absolute_time() * (double)tb.numer / (double)tb.denom / 1e9;
 }
 
 static NSString *NMOEJoinPath(NSString *base, NSString *component) {
@@ -2597,6 +2769,222 @@ static void NMOELinearAttentionStep(nmoe_runtime *rt,
     }
 }
 
+// Encode the routed-expert kernels + combine + next-layer input norm into cmd.
+// In pipelined mode `expertWeights` is NULL: combine weights come from
+// g_expertParamsBuf (filled by the CPU during the service window) and `valid`
+// is NULL (all K slots are encoded; invalid slots are neutralized by a zero
+// combine weight). In legacy synchronous mode `expertWeights`/`valid` carry
+// the routing results known at encode time.
+static BOOL NMOEEncodeExpertPhase(id<MTLCommandBuffer> cmd,
+                                  nmoe_runtime *rt,
+                                  const NMOELayerWeights *layer,
+                                  __strong id<MTLBuffer> *expertBuffers,
+                                  size_t selectedCount,
+                                  const int *valid,
+                                  const float *expertWeights,
+                                  float sharedGateScore,
+                                  void *outputBuf,
+                                  int layerIndex,
+                                  const NMOEExpertOffsets *offsets,
+                                  BOOL *outNextInputNormReady) {
+    if (cmd == nil || rt == NULL || layer == NULL || expertBuffers == NULL ||
+        selectedCount == 0 || outputBuf == NULL || offsets == NULL) return NO;
+
+    BOOL useFusedDownCombineQ4 = (rt->quantBits == 4 && g_expertIOExpertActBuf != NULL &&
+                                  NMOEUseFusedDownCombineQ4());
+    if (!useFusedDownCombineQ4) {
+        if (!NMOEEncodeDequantMatVecTensor(cmd, rt, &layer->sharedDownProj,
+                                           g_expertIOSharedActBuf, 0, g_expertIOSharedDownBuf, 0,
+                                           kNMOEHiddenDim, 512u)) return NO;
+    }
+
+    id<MTLComputePipelineState> expertPipe = (__bridge id<MTLComputePipelineState>)nmoe_backend_pipeline_state(rt->backend,
+        rt->quantBits == 2 ? NMOE_BACKEND_KERNEL_DEQUANT_MATVEC_Q2 : NMOE_BACKEND_KERNEL_DEQUANT_MATVEC_Q4);
+    id<MTLComputePipelineState> swigluPipe = (__bridge id<MTLComputePipelineState>)nmoe_backend_pipeline_state(rt->backend, NMOE_BACKEND_KERNEL_MOE_EXPERT_GATE_UP);
+    id<MTLComputePipelineState> gateUpQ4Pipe = (__bridge id<MTLComputePipelineState>)nmoe_backend_pipeline_state(rt->backend, NMOE_BACKEND_KERNEL_EXPERT_GATE_UP_Q4);
+    id<MTLComputePipelineState> gateUpQ4BatchedPipe = (__bridge id<MTLComputePipelineState>)nmoe_backend_pipeline_state(rt->backend, NMOE_BACKEND_KERNEL_EXPERT_GATE_UP_Q4_BATCHED);
+    id<MTLComputePipelineState> downQ4BatchedPipe = (__bridge id<MTLComputePipelineState>)nmoe_backend_pipeline_state(rt->backend, NMOE_BACKEND_KERNEL_EXPERT_DOWN_Q4_BATCHED);
+    id<MTLBuffer> expertInputMTL = (__bridge id<MTLBuffer>)g_expertIOInputBuf;
+    id<MTLBuffer> expertGateMTL = NMOEBridgeBuffer(rt->expertGateBuffer);
+    id<MTLBuffer> expertUpMTL = NMOEBridgeBuffer(rt->expertUpBuffer);
+    id<MTLBuffer> expertActMTL = NMOEBridgeBuffer(rt->expertActBuffer);
+    if (expertPipe == nil || swigluPipe == nil || expertInputMTL == nil ||
+        expertGateMTL == nil || expertUpMTL == nil || expertActMTL == nil) return NO;
+
+    BOOL usedBatchedQ4 = NO;
+    BOOL usedFusedDownCombineQ4 = NO;
+    if (rt->quantBits == 4 && g_expertIOExpertActBuf != NULL &&
+        gateUpQ4BatchedPipe != nil && downQ4BatchedPipe != nil) {
+        id<MTLBuffer> expertActBatchMTL = (__bridge id<MTLBuffer>)g_expertIOExpertActBuf;
+        if (!NMOEEncodeExpertGateUpQ4Batched(cmd, rt, expertBuffers, selectedCount,
+                                              expertInputMTL, expertActBatchMTL, offsets)) return NO;
+        if (useFusedDownCombineQ4) {
+            if (!NMOEEncodeExpertDownCombineQ4Tensor(cmd, rt, expertBuffers, selectedCount,
+                                                     expertActBatchMTL, g_expertIOHMidBuf,
+                                                     g_expertIOSharedActBuf, g_expertIOSharedDownBuf, outputBuf,
+                                                     expertWeights, sharedGateScore,
+                                                     &layer->sharedDownProj, offsets)) return NO;
+            usedFusedDownCombineQ4 = YES;
+        } else {
+            void *expertOutPtrs[8] = {0};
+            for (int i = 0; i < 8; i++) expertOutPtrs[i] = g_expertOutBuffers[i];
+            if (!NMOEEncodeExpertDownQ4Batched(cmd, rt, expertBuffers, expertOutPtrs,
+                                               selectedCount, expertActBatchMTL, offsets)) return NO;
+        }
+        usedBatchedQ4 = YES;
+    }
+    for (size_t idx = 0; !usedBatchedQ4 && idx < selectedCount; ++idx) {
+        if (valid != NULL && !valid[idx]) continue;
+        id<MTLBuffer> ebuf = expertBuffers[idx];
+        if (ebuf == nil) return NO;
+        id<MTLBuffer> expertOutMTL = (__bridge id<MTLBuffer>)g_expertOutBuffers[idx];
+        if (expertOutMTL == nil) return NO;
+        if (rt->quantBits == 4 && gateUpQ4Pipe != nil) {
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            if (enc == nil) return NO;
+            if (!NMOEEncodeExpertGateUpQ4OnEncoder(enc, gateUpQ4Pipe, ebuf,
+                                                   offsets, expertInputMTL, expertActMTL)) return NO;
+            if (!NMOEEncodeDequantMatVecFromBufferOnEncoder(enc, expertPipe, ebuf,
+                                                             offsets->down_weight, offsets->down_scales, offsets->down_biases,
+                                                             expertActMTL, 0, expertOutMTL, 0,
+                                                             kNMOEHiddenDim, 512u, rt->quantBits)) return NO;
+            [enc endEncoding];
+            continue;
+        }
+        {
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            if (enc == nil) return NO;
+            if (!NMOEEncodeDequantMatVecFromBufferOnEncoder(enc, expertPipe, ebuf,
+                                                             offsets->gate_weight, offsets->gate_scales, offsets->gate_biases,
+                                                             expertInputMTL, 0, expertGateMTL, 0,
+                                                             512u, kNMOEHiddenDim, rt->quantBits)) return NO;
+            if (!NMOEEncodeDequantMatVecFromBufferOnEncoder(enc, expertPipe, ebuf,
+                                                             offsets->up_weight, offsets->up_scales, offsets->up_biases,
+                                                             expertInputMTL, 0, expertUpMTL, 0,
+                                                             512u, kNMOEHiddenDim, rt->quantBits)) return NO;
+            [enc endEncoding];
+        }
+        {
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            if (enc == nil) return NO;
+            if (!NMOEEncodeMoeExpertGateUpOnEncoder(enc, swigluPipe,
+                                                    expertGateMTL, 0, expertUpMTL, 0, expertActMTL, 0, 512u)) return NO;
+            if (!NMOEEncodeDequantMatVecFromBufferOnEncoder(enc, expertPipe, ebuf,
+                                                             offsets->down_weight, offsets->down_scales, offsets->down_biases,
+                                                             expertActMTL, 0, expertOutMTL, 0,
+                                                             kNMOEHiddenDim, 512u, rt->quantBits)) return NO;
+            [enc endEncoding];
+        }
+    }
+
+    if (!usedFusedDownCombineQ4) {
+        void *expertOutPtrs[8] = {0};
+        for (int i = 0; i < 8; i++) expertOutPtrs[i] = g_expertOutBuffers[i];
+        if (!NMOEEncodeWeightedExpertSum(cmd, rt, g_expertIOHMidBuf, g_expertIOSharedDownBuf,
+                                          outputBuf, expertOutPtrs, kNMOEHiddenDim, selectedCount,
+                                          expertWeights, sharedGateScore)) return NO;
+    }
+
+    BOOL nextInputNormReady = NO;
+    int nextInputNormLayer = layerIndex + 1;
+    if (nextInputNormLayer < (int)kNMOELayers) {
+        if (!NMOEEncodeRMSNormTensor(cmd, rt, &rt->layers[nextInputNormLayer].inputNorm,
+                                     outputBuf, 0, rt->normBuffer, 0,
+                                     kNMOEHiddenDim, YES, 1e-6f)) return NO;
+        nextInputNormReady = YES;
+    }
+    if (outNextInputNormReady != NULL) *outNextInputNormReady = nextInputNormReady;
+    return YES;
+}
+
+// Pipelined per-layer tail: signal route results / wait for expert data inside
+// the SAME command buffer, so each layer is one cmdbuf and the CPU never calls
+// waitUntilCompleted on the per-layer critical path.
+static BOOL NMOEPipelinedExpertTail(nmoe_runtime *rt,
+                                    id<MTLCommandBuffer> cmd,
+                                    const NMOELayerWeights *layer,
+                                    NMOEExpertLayerFile *expertFile,
+                                    void *outputBuf,
+                                    int layerIndex,
+                                    BOOL cpuRouter,
+                                    NMOEPerfStats *stats,
+                                    double t0) {
+    id<MTLSharedEvent> evRoute = g_expertRouteEvent;
+    id<MTLSharedEvent> evData = g_expertDataEvent;
+    id<MTLBuffer> paramsBuf = (__bridge id<MTLBuffer>)g_expertParamsBuf;
+    if (evRoute == nil || evData == nil || paramsBuf == nil || expertFile == NULL ||
+        expertFile->fd < 0) return NO;
+
+    size_t K = (size_t)MAX(1, MIN(rt->cfg.experts, (int)kNMOEMaxExperts));
+    __strong id<MTLBuffer> expertBuffers[8] = {nil};
+    for (int i = 0; i < 8; ++i) expertBuffers[i] = (__bridge id<MTLBuffer>)g_expertIOBuffers[i];
+    if (expertBuffers[0] == nil) return NO;
+
+    NMOEExpertOffsets offsets = *NMOEExpertOffsetsForBits(rt->quantBits);
+    uint64_t ev = ++g_expertEventValue;
+    [cmd encodeSignalEvent:evRoute value:ev];
+    [cmd encodeWaitForEvent:evData value:ev];
+    BOOL nextInputNormReady = NO;
+    if (!NMOEEncodeExpertPhase(cmd, rt, layer, expertBuffers, K, NULL, NULL, 0.0f,
+                               outputBuf, layerIndex, &offsets, &nextInputNormReady)) {
+        return NO; // nothing committed yet — safe to bail
+    }
+    [cmd commit];
+
+    // --- service window: GPU runs the context kernels, CPU waits for routing ---
+    double syncStart = NMOENowSeconds();
+    BOOL signaled = [evRoute waitUntilSignaledValue:ev timeoutMS:30000];
+    if (stats != NULL) stats->contextSync += NMOENowSeconds() - syncStart;
+    if (stats != NULL) stats->context += NMOENowSeconds() - t0;
+    if (!signaled) {
+        evData.signaledValue = ev; // unblock the GPU before bailing
+        return NO;
+    }
+
+    double t1 = NMOENowSeconds();
+    float selectedValues[kNMOEMaxExperts] = {0};
+    size_t selectedIndices[kNMOEMaxExperts] = {0};
+    size_t selectedCount = cpuRouter
+        ? NMOESelectRouteTopKCPU(rt, K, selectedIndices, selectedValues)
+        : NMOEReadRouteTopKMetal(rt, K, selectedIndices, selectedValues);
+    if (selectedCount == 0) {
+        evData.signaledValue = ev;
+        return NO;
+    }
+    if (stats != NULL) stats->route += NMOENowSeconds() - t1;
+    float sharedGateScore = NMOEFloatBuffer(rt->sharedOutBuffer)[0];
+
+    // pread the selected experts into the fixed IO buffers (page-cache backed;
+    // mmapBase intentionally NULL to take the pread path)
+    t1 = NMOENowSeconds();
+    int valid[8] = {0};
+    NMOEAsyncReadExperts(expertFile->fd, NULL, selectedIndices, selectedCount,
+                         g_expertIOBuffers, valid);
+    if (stats != NULL) stats->expertFetch += NMOENowSeconds() - t1;
+
+    t1 = NMOENowSeconds();
+    memcpy(((__bridge id<MTLBuffer>)g_expertIOHMidBuf).contents, NMOEFloatBuffer(outputBuf), kNMOEHiddenDim * sizeof(float));
+    memcpy(((__bridge id<MTLBuffer>)g_expertIOInputBuf).contents, NMOEFloatBuffer(rt->normBuffer), kNMOEHiddenDim * sizeof(float));
+
+    float params[16];
+    memset(params, 0, sizeof(params));
+    for (size_t i = 0; i < selectedCount && i < 8; ++i) {
+        params[i] = valid[i] ? selectedValues[i] : 0.0f;
+    }
+    params[8] = sharedGateScore;
+    memcpy(paramsBuf.contents, params, sizeof(params));
+    evData.signaledValue = ev; // release the GPU's expert kernels
+
+    g_deferredExperts.active = YES;
+    g_deferredExperts.gpuCombined = YES;
+    g_deferredExperts.nextInputNormReady = nextInputNormReady;
+    g_deferredExperts.nextInputNormLayer = nextInputNormReady ? layerIndex + 1 : -1;
+    g_deferredExperts.cmdExperts = cmd;
+    for (int i = 0; i < 8; ++i) g_deferredExperts.expertBuffers[i] = nil;
+    if (stats != NULL) stats->expert += NMOENowSeconds() - t1;
+    return YES;
+}
+
 static BOOL NMOEFullAttentionStepMetal(nmoe_runtime *rt,
                                        int layerIndex,
                                        const float *residual,
@@ -2669,8 +3057,27 @@ static BOOL NMOEFullAttentionStepMetal(nmoe_runtime *rt,
             }
         }
 
+        // --- attention: fused single-pass decode kernel (default) ---
+        if (NMOEUseFusedAttention()) {
+            id<MTLComputePipelineState> fp = (__bridge id<MTLComputePipelineState>)nmoe_backend_pipeline_state(rt->backend, NMOE_BACKEND_KERNEL_ATTN_DECODE_FUSED);
+            if (fp == nil) return NO;
+            NMOEAttentionArgs fargs = {
+                .seqLen = (uint32_t)seqLen, .seqStride = (uint32_t)rt->sequenceCapacity,
+                .headDim = (uint32_t)kNMOEHeadDim, .qStride = 512u, .kvStride = (uint32_t)kNMOEHeadDim,
+                .cacheStride = (uint32_t)(kNMOEFullKVHeads * kNMOEHeadDim),
+                .fullHeads = (uint32_t)kNMOEFullHeads, .fullKVHeads = (uint32_t)kNMOEFullKVHeads,
+                .invScale = invScale,
+            };
+            if (!NMOEEncodeKernelTG(cmd, fp, (NSUInteger)kNMOEFullHeads, 256, ^(id<MTLComputeCommandEncoder> enc) {
+                [enc setBuffer:NMOEBridgeBuffer(rt->fullQProjBuffer) offset:0 atIndex:0];
+                [enc setBuffer:NMOEBridgeBuffer(state->fullKCache) offset:0 atIndex:1];
+                [enc setBuffer:NMOEBridgeBuffer(state->fullVCache) offset:0 atIndex:2];
+                [enc setBuffer:NMOEBridgeBuffer(rt->fullAttnBuffer) offset:0 atIndex:3];
+                [enc setBytes:&fargs length:sizeof(fargs) atIndex:4];
+            })) return NO;
+        }
         // --- attention scores (batched per head*pos) ---
-        {
+        if (!NMOEUseFusedAttention()) {
             id<MTLComputePipelineState> p = (__bridge id<MTLComputePipelineState>)nmoe_backend_pipeline_state(rt->backend, NMOE_BACKEND_KERNEL_ATTN_SCORES_BATCHED);
             if (p == nil) return NO;
             NMOEAttentionArgs args = {
@@ -2688,7 +3095,7 @@ static BOOL NMOEFullAttentionStepMetal(nmoe_runtime *rt,
             })) return NO;
         }
         // --- attention softmax ---
-        {
+        if (!NMOEUseFusedAttention()) {
             id<MTLComputePipelineState> sp = (__bridge id<MTLComputePipelineState>)nmoe_backend_pipeline_state(rt->backend, NMOE_BACKEND_KERNEL_ATTN_SOFTMAX_BATCHED);
             if (sp == nil) return NO;
             NMOEAttentionArgs sargs = {
@@ -2703,7 +3110,7 @@ static BOOL NMOEFullAttentionStepMetal(nmoe_runtime *rt,
             })) return NO;
         }
         // --- attention values ---
-        {
+        if (!NMOEUseFusedAttention()) {
             id<MTLComputePipelineState> vp = (__bridge id<MTLComputePipelineState>)nmoe_backend_pipeline_state(rt->backend, NMOE_BACKEND_KERNEL_ATTN_VALUES_BATCHED);
             if (vp == nil) return NO;
             NMOEAttentionArgs vargs = {
@@ -2775,10 +3182,18 @@ static BOOL NMOEFullAttentionStepMetal(nmoe_runtime *rt,
             return YES;
         }
 
+        if (NMOEUsePipelinedExperts()) {
+            return NMOEPipelinedExpertTail(rt, cmd, layer, expertFile, outputBuf,
+                                           layerIndex, cpuRouter, stats, t0);
+        }
+
         [cmd commit];
         double syncStart = NMOENowSeconds();
         [cmd waitUntilCompleted];
-        if (stats != NULL) stats->contextSync += NMOENowSeconds() - syncStart;
+        if (stats != NULL) {
+            stats->contextSync += NMOENowSeconds() - syncStart;
+            stats->contextGpu += cmd.GPUEndTime - cmd.GPUStartTime;
+        }
     }
     double deferredStart = NMOENowSeconds();
     NMOEFinalizeDeferredExperts(rt);
@@ -2815,115 +3230,16 @@ static BOOL NMOEFullAttentionStepMetal(nmoe_runtime *rt,
         id<MTLCommandBuffer> cmd = [queue commandBuffer];
         if (cmd == nil) return NO;
 
-        BOOL useFusedDownCombineQ4 = (rt->quantBits == 4 && g_expertIOExpertActBuf != NULL &&
-                                      NMOEUseFusedDownCombineQ4());
-        if (!useFusedDownCombineQ4) {
-            if (!NMOEEncodeDequantMatVecTensor(cmd, rt, &layer->sharedDownProj,
-                                               g_expertIOSharedActBuf, 0, g_expertIOSharedDownBuf, 0,
-                                               kNMOEHiddenDim, 512u)) return NO;
-        }
-
-	        // Per expert: gate + up + swiglu + down
-	        id<MTLComputePipelineState> expertPipe = (__bridge id<MTLComputePipelineState>)nmoe_backend_pipeline_state(rt->backend,
-	            rt->quantBits == 2 ? NMOE_BACKEND_KERNEL_DEQUANT_MATVEC_Q2 : NMOE_BACKEND_KERNEL_DEQUANT_MATVEC_Q4);
-	        id<MTLComputePipelineState> swigluPipe = (__bridge id<MTLComputePipelineState>)nmoe_backend_pipeline_state(rt->backend, NMOE_BACKEND_KERNEL_MOE_EXPERT_GATE_UP);
-	        id<MTLComputePipelineState> gateUpQ4Pipe = (__bridge id<MTLComputePipelineState>)nmoe_backend_pipeline_state(rt->backend, NMOE_BACKEND_KERNEL_EXPERT_GATE_UP_Q4);
-	        id<MTLComputePipelineState> gateUpQ4BatchedPipe = (__bridge id<MTLComputePipelineState>)nmoe_backend_pipeline_state(rt->backend, NMOE_BACKEND_KERNEL_EXPERT_GATE_UP_Q4_BATCHED);
-	        id<MTLComputePipelineState> downQ4BatchedPipe = (__bridge id<MTLComputePipelineState>)nmoe_backend_pipeline_state(rt->backend, NMOE_BACKEND_KERNEL_EXPERT_DOWN_Q4_BATCHED);
-	        id<MTLBuffer> expertInputMTL = (__bridge id<MTLBuffer>)g_expertIOInputBuf;
-	        id<MTLBuffer> expertGateMTL = NMOEBridgeBuffer(rt->expertGateBuffer);
-	        id<MTLBuffer> expertUpMTL = NMOEBridgeBuffer(rt->expertUpBuffer);
-	        id<MTLBuffer> expertActMTL = NMOEBridgeBuffer(rt->expertActBuffer);
-	        if (expertPipe == nil || swigluPipe == nil || expertInputMTL == nil ||
-	            expertGateMTL == nil || expertUpMTL == nil || expertActMTL == nil) return NO;
-	        BOOL usedBatchedQ4 = NO;
-	        BOOL usedFusedDownCombineQ4 = NO;
-	        if (rt->quantBits == 4 && g_expertIOExpertActBuf != NULL &&
-	            gateUpQ4BatchedPipe != nil && downQ4BatchedPipe != nil) {
-	            id<MTLBuffer> expertActBatchMTL = (__bridge id<MTLBuffer>)g_expertIOExpertActBuf;
-	            if (!NMOEEncodeExpertGateUpQ4Batched(cmd, rt, expertBuffers, selectedCount,
-	                                                  expertInputMTL, expertActBatchMTL, &offsets)) return NO;
-	            if (useFusedDownCombineQ4) {
-		                if (!NMOEEncodeExpertDownCombineQ4Tensor(cmd, rt, expertBuffers, selectedCount,
-		                                                         expertActBatchMTL, g_expertIOHMidBuf,
-		                                                         g_expertIOSharedActBuf, g_expertIOSharedDownBuf, outputBuf,
-		                                                         selectedValues, sharedGateScore,
-		                                                         &layer->sharedDownProj, &offsets)) return NO;
-	                usedFusedDownCombineQ4 = YES;
-	            } else {
-	                void *expertOutPtrs[8] = {0};
-	                for (int i = 0; i < 8; i++) expertOutPtrs[i] = g_expertOutBuffers[i];
-	                if (!NMOEEncodeExpertDownQ4Batched(cmd, rt, expertBuffers, expertOutPtrs,
-	                                                   selectedCount, expertActBatchMTL, &offsets)) return NO;
-	            }
-	            usedBatchedQ4 = YES;
-	        }
-	        for (size_t idx = 0; !usedBatchedQ4 && idx < selectedCount; ++idx) {
-	            if (!valid[idx]) continue;
-	            id<MTLBuffer> ebuf = expertBuffers[idx];
-	            if (ebuf == nil) return NO;
-	            id<MTLBuffer> expertOutMTL = (__bridge id<MTLBuffer>)g_expertOutBuffers[idx];
-	            if (expertOutMTL == nil) return NO;
-	            if (rt->quantBits == 4 && gateUpQ4Pipe != nil) {
-	                id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-	                if (enc == nil) return NO;
-	                if (!NMOEEncodeExpertGateUpQ4OnEncoder(enc, gateUpQ4Pipe, ebuf,
-	                                                       &offsets, expertInputMTL, expertActMTL)) return NO;
-	                if (!NMOEEncodeDequantMatVecFromBufferOnEncoder(enc, expertPipe, ebuf,
-	                                                                 offsets.down_weight, offsets.down_scales, offsets.down_biases,
-	                                                                 expertActMTL, 0, expertOutMTL, 0,
-	                                                                 kNMOEHiddenDim, 512u, rt->quantBits)) return NO;
-	                [enc endEncoding];
-	                continue;
-	            }
-	            {
-	                id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-	                if (enc == nil) return NO;
-	                if (!NMOEEncodeDequantMatVecFromBufferOnEncoder(enc, expertPipe, ebuf,
-	                                                                 offsets.gate_weight, offsets.gate_scales, offsets.gate_biases,
-	                                                                 expertInputMTL, 0, expertGateMTL, 0,
-	                                                                 512u, kNMOEHiddenDim, rt->quantBits)) return NO;
-	                if (!NMOEEncodeDequantMatVecFromBufferOnEncoder(enc, expertPipe, ebuf,
-	                                                                 offsets.up_weight, offsets.up_scales, offsets.up_biases,
-	                                                                 expertInputMTL, 0, expertUpMTL, 0,
-	                                                                 512u, kNMOEHiddenDim, rt->quantBits)) return NO;
-	                [enc endEncoding];
-	            }
-	            {
-	                id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-	                if (enc == nil) return NO;
-	                if (!NMOEEncodeMoeExpertGateUpOnEncoder(enc, swigluPipe,
-	                                                        expertGateMTL, 0, expertUpMTL, 0, expertActMTL, 0, 512u)) return NO;
-	                if (!NMOEEncodeDequantMatVecFromBufferOnEncoder(enc, expertPipe, ebuf,
-	                                                                 offsets.down_weight, offsets.down_scales, offsets.down_biases,
-	                                                                 expertActMTL, 0, expertOutMTL, 0,
-	                                                                 kNMOEHiddenDim, 512u, rt->quantBits)) return NO;
-	                [enc endEncoding];
-	            }
-	        }
-
-        // Fused weighted combine
-        if (!usedFusedDownCombineQ4) {
-            void *expertOutPtrs[8] = {0};
-            for (int i = 0; i < 8; i++) expertOutPtrs[i] = g_expertOutBuffers[i];
-            if (!NMOEEncodeWeightedExpertSum(cmd, rt, g_expertIOHMidBuf, g_expertIOSharedDownBuf,
-                                              outputBuf, expertOutPtrs, kNMOEHiddenDim, selectedCount,
-                                              selectedValues, sharedGateScore)) return NO;
-        }
         BOOL nextInputNormReady = NO;
-        int nextInputNormLayer = layerIndex + 1;
-        if (nextInputNormLayer < (int)kNMOELayers) {
-            if (!NMOEEncodeRMSNormTensor(cmd, rt, &rt->layers[nextInputNormLayer].inputNorm,
-                                         outputBuf, 0, rt->normBuffer, 0,
-                                         kNMOEHiddenDim, YES, 1e-6f)) return NO;
-            nextInputNormReady = YES;
-        }
+        if (!NMOEEncodeExpertPhase(cmd, rt, layer, expertBuffers, selectedCount, valid,
+                                   selectedValues, sharedGateScore, outputBuf, layerIndex,
+                                   &offsets, &nextInputNormReady)) return NO;
 
         [cmd commit];
         g_deferredExperts.active = YES;
         g_deferredExperts.gpuCombined = YES;
         g_deferredExperts.nextInputNormReady = nextInputNormReady;
-        g_deferredExperts.nextInputNormLayer = nextInputNormReady ? nextInputNormLayer : -1;
+        g_deferredExperts.nextInputNormLayer = nextInputNormReady ? layerIndex + 1 : -1;
         g_deferredExperts.cmdExperts = cmd;
         for (int i = 0; i < 8; ++i) {
             g_deferredExperts.expertBuffers[i] = i < (int)selectedCount ? expertBuffers[i] : nil;
@@ -2989,7 +3305,10 @@ static BOOL NMOEFullAttentionStateOnlyMetal(nmoe_runtime *rt,
     [cmd commit];
     double syncStart = NMOENowSeconds();
     [cmd waitUntilCompleted];
-    if (stats != NULL) stats->contextSync += NMOENowSeconds() - syncStart;
+    if (stats != NULL) {
+        stats->contextSync += NMOENowSeconds() - syncStart;
+        stats->contextGpu += cmd.GPUEndTime - cmd.GPUStartTime;
+    }
     double deferredStart = NMOENowSeconds();
     NMOEFinalizeDeferredExperts(rt);
     if (stats != NULL) stats->deferredWait += NMOENowSeconds() - deferredStart;
@@ -3044,15 +3363,17 @@ static BOOL NMOELinearAttentionStepMetal(nmoe_runtime *rt,
                                      residualBuf, 0, rt->normBuffer, 0,
                                      kNMOEHiddenDim, YES, 1e-6f)) return NO;
 
-        // --- QKV/Z/Beta/Alpha projections ---
-        if (!NMOEEncodeDequantMatVecTensor(contextCmd, rt, &layer->u.linear.qkvProj,
-                                           rt->normBuffer, 0, rt->linearQkvBuffer, 0, 8192u, kNMOEHiddenDim)) return NO;
-        if (!NMOEEncodeDequantMatVecTensor(contextCmd, rt, &layer->u.linear.zProj,
-                                           rt->normBuffer, 0, rt->linearZBuffer, 0, 4096u, kNMOEHiddenDim)) return NO;
-        if (!NMOEEncodeDequantMatVecTensor(contextCmd, rt, &layer->u.linear.betaProj,
-                                           rt->normBuffer, 0, rt->linearBetaBuffer, 0, 32u, kNMOEHiddenDim)) return NO;
-        if (!NMOEEncodeDequantMatVecTensor(contextCmd, rt, &layer->u.linear.alphaProj,
-                                           rt->normBuffer, 0, rt->linearAlphaBuffer, 0, 32u, kNMOEHiddenDim)) return NO;
+        // --- QKV/Z/Beta/Alpha projections (fused GEMM) ---
+        if (!NMOEEncodeLinearProjQ4(contextCmd, rt,
+                                    &layer->u.linear.qkvProj,
+                                    &layer->u.linear.zProj,
+                                    &layer->u.linear.betaProj,
+                                    &layer->u.linear.alphaProj,
+                                    rt->normBuffer, 0,
+                                    rt->linearQkvBuffer, 0,
+                                    rt->linearZBuffer, 0,
+                                    rt->linearBetaBuffer, 0,
+                                    rt->linearAlphaBuffer, 0)) return NO;
 
         // --- Conv1d ---
         {
@@ -3207,10 +3528,23 @@ static BOOL NMOELinearAttentionStepMetal(nmoe_runtime *rt,
             if (stats != NULL) stats->context += NMOENowSeconds() - t0;
             return YES;
         }
+        if (NMOEUsePipelinedExperts()) {
+            return NMOEPipelinedExpertTail(rt, contextCmd, layer, expertFile, outputBuf,
+                                           layerIndex, cpuRouter, stats, t0);
+        }
         [contextCmd commit];
         double syncStart = NMOENowSeconds();
+        double commitHost = NMOEHostSeconds();
         [contextCmd waitUntilCompleted];
-        if (stats != NULL) stats->contextSync += NMOENowSeconds() - syncStart;
+        double returnHost = NMOEHostSeconds();
+        if (stats != NULL) {
+            stats->contextSync += NMOENowSeconds() - syncStart;
+            stats->contextGpu += contextCmd.GPUEndTime - contextCmd.GPUStartTime;
+            stats->contextDriver += contextCmd.kernelEndTime - contextCmd.kernelStartTime;
+            stats->contextQueue += contextCmd.GPUStartTime - contextCmd.kernelEndTime;
+            stats->contextCommitLag += contextCmd.kernelStartTime - commitHost;
+            stats->contextEndLag += returnHost - contextCmd.GPUEndTime;
+        }
     }
     double deferredStart = NMOENowSeconds();
     NMOEFinalizeDeferredExperts(rt);
@@ -3235,114 +3569,21 @@ static BOOL NMOELinearAttentionStepMetal(nmoe_runtime *rt,
     memcpy(((__bridge id<MTLBuffer>)g_expertIOHMidBuf).contents, NMOEFloatBuffer(outputBuf), kNMOEHiddenDim * sizeof(float));
     memcpy(((__bridge id<MTLBuffer>)g_expertIOInputBuf).contents, NMOEFloatBuffer(rt->normBuffer), kNMOEHiddenDim * sizeof(float));
 
+    // ---- Expert GPU stage (DEFERRED) ----
     {
         id<MTLCommandBuffer> cmd = [queue commandBuffer];
         if (cmd == nil) return NO;
-        BOOL useFusedDownCombineQ4 = (rt->quantBits == 4 && g_expertIOExpertActBuf != NULL &&
-                                      NMOEUseFusedDownCombineQ4());
-        if (!useFusedDownCombineQ4) {
-            if (!NMOEEncodeDequantMatVecTensor(cmd, rt, &layer->sharedDownProj,
-                                               g_expertIOSharedActBuf, 0, g_expertIOSharedDownBuf, 0,
-                                               kNMOEHiddenDim, 512u)) return NO;
-        }
-        id<MTLComputePipelineState> expertPipe = (__bridge id<MTLComputePipelineState>)nmoe_backend_pipeline_state(rt->backend,
-            rt->quantBits == 2 ? NMOE_BACKEND_KERNEL_DEQUANT_MATVEC_Q2 : NMOE_BACKEND_KERNEL_DEQUANT_MATVEC_Q4);
-        id<MTLComputePipelineState> swigluPipe = (__bridge id<MTLComputePipelineState>)nmoe_backend_pipeline_state(rt->backend, NMOE_BACKEND_KERNEL_MOE_EXPERT_GATE_UP);
-        id<MTLComputePipelineState> gateUpQ4Pipe = (__bridge id<MTLComputePipelineState>)nmoe_backend_pipeline_state(rt->backend, NMOE_BACKEND_KERNEL_EXPERT_GATE_UP_Q4);
-        id<MTLComputePipelineState> gateUpQ4BatchedPipe = (__bridge id<MTLComputePipelineState>)nmoe_backend_pipeline_state(rt->backend, NMOE_BACKEND_KERNEL_EXPERT_GATE_UP_Q4_BATCHED);
-        id<MTLComputePipelineState> downQ4BatchedPipe = (__bridge id<MTLComputePipelineState>)nmoe_backend_pipeline_state(rt->backend, NMOE_BACKEND_KERNEL_EXPERT_DOWN_Q4_BATCHED);
-        id<MTLBuffer> expertInputMTL = (__bridge id<MTLBuffer>)g_expertIOInputBuf;
-        id<MTLBuffer> expertGateMTL = NMOEBridgeBuffer(rt->expertGateBuffer);
-        id<MTLBuffer> expertUpMTL = NMOEBridgeBuffer(rt->expertUpBuffer);
-        id<MTLBuffer> expertActMTL = NMOEBridgeBuffer(rt->expertActBuffer);
-        if (expertPipe == nil || swigluPipe == nil || expertInputMTL == nil ||
-            expertGateMTL == nil || expertUpMTL == nil || expertActMTL == nil) return NO;
-        BOOL usedBatchedQ4 = NO;
-        BOOL usedFusedDownCombineQ4 = NO;
-        if (rt->quantBits == 4 && g_expertIOExpertActBuf != NULL &&
-            gateUpQ4BatchedPipe != nil && downQ4BatchedPipe != nil) {
-            id<MTLBuffer> expertActBatchMTL = (__bridge id<MTLBuffer>)g_expertIOExpertActBuf;
-            if (!NMOEEncodeExpertGateUpQ4Batched(cmd, rt, expertBuffers, selectedCount,
-                                                  expertInputMTL, expertActBatchMTL, &offsets)) return NO;
-            if (useFusedDownCombineQ4) {
-                if (!NMOEEncodeExpertDownCombineQ4Tensor(cmd, rt, expertBuffers, selectedCount,
-                                                         expertActBatchMTL, g_expertIOHMidBuf,
-                                                         g_expertIOSharedActBuf, g_expertIOSharedDownBuf, outputBuf,
-                                                         selectedValues, sharedGateScore,
-                                                         &layer->sharedDownProj, &offsets)) return NO;
-                usedFusedDownCombineQ4 = YES;
-            } else {
-                void *expertOutPtrs[8] = {0};
-                for (int i = 0; i < 8; i++) expertOutPtrs[i] = g_expertOutBuffers[i];
-                if (!NMOEEncodeExpertDownQ4Batched(cmd, rt, expertBuffers, expertOutPtrs,
-                                                   selectedCount, expertActBatchMTL, &offsets)) return NO;
-            }
-            usedBatchedQ4 = YES;
-        }
-        for (size_t idx = 0; !usedBatchedQ4 && idx < selectedCount; ++idx) {
-            if (!valid[idx]) continue;
-            id<MTLBuffer> ebuf = expertBuffers[idx];
-            if (ebuf == nil) return NO;
-            id<MTLBuffer> expertOutMTL = (__bridge id<MTLBuffer>)g_expertOutBuffers[idx];
-            if (expertOutMTL == nil) return NO;
-            if (rt->quantBits == 4 && gateUpQ4Pipe != nil) {
-                id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-                if (enc == nil) return NO;
-                if (!NMOEEncodeExpertGateUpQ4OnEncoder(enc, gateUpQ4Pipe, ebuf,
-                                                       &offsets, expertInputMTL, expertActMTL)) return NO;
-                if (!NMOEEncodeDequantMatVecFromBufferOnEncoder(enc, expertPipe, ebuf,
-                                                                 offsets.down_weight, offsets.down_scales, offsets.down_biases,
-                                                                 expertActMTL, 0, expertOutMTL, 0,
-                                                                 kNMOEHiddenDim, 512u, rt->quantBits)) return NO;
-                [enc endEncoding];
-                continue;
-            }
-            {
-                id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-                if (enc == nil) return NO;
-                if (!NMOEEncodeDequantMatVecFromBufferOnEncoder(enc, expertPipe, ebuf,
-                                                                 offsets.gate_weight, offsets.gate_scales, offsets.gate_biases,
-                                                                 expertInputMTL, 0, expertGateMTL, 0,
-                                                                 512u, kNMOEHiddenDim, rt->quantBits)) return NO;
-                if (!NMOEEncodeDequantMatVecFromBufferOnEncoder(enc, expertPipe, ebuf,
-                                                                 offsets.up_weight, offsets.up_scales, offsets.up_biases,
-                                                                 expertInputMTL, 0, expertUpMTL, 0,
-                                                                 512u, kNMOEHiddenDim, rt->quantBits)) return NO;
-                [enc endEncoding];
-            }
-            {
-                id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-                if (enc == nil) return NO;
-                if (!NMOEEncodeMoeExpertGateUpOnEncoder(enc, swigluPipe,
-                                                        expertGateMTL, 0, expertUpMTL, 0, expertActMTL, 0, 512u)) return NO;
-                if (!NMOEEncodeDequantMatVecFromBufferOnEncoder(enc, expertPipe, ebuf,
-                                                                 offsets.down_weight, offsets.down_scales, offsets.down_biases,
-                                                                 expertActMTL, 0, expertOutMTL, 0,
-                                                                 kNMOEHiddenDim, 512u, rt->quantBits)) return NO;
-                [enc endEncoding];
-            }
-        }
-        if (!usedFusedDownCombineQ4) {
-            void *expertOutPtrs[8] = {0};
-            for (int i = 0; i < 8; i++) expertOutPtrs[i] = g_expertOutBuffers[i];
-            if (!NMOEEncodeWeightedExpertSum(cmd, rt, g_expertIOHMidBuf, g_expertIOSharedDownBuf,
-                                              outputBuf, expertOutPtrs, kNMOEHiddenDim, selectedCount,
-                                              selectedValues, sharedGateScore)) return NO;
-        }
+
         BOOL nextInputNormReady = NO;
-        int nextInputNormLayer = layerIndex + 1;
-        if (nextInputNormLayer < (int)kNMOELayers) {
-            if (!NMOEEncodeRMSNormTensor(cmd, rt, &rt->layers[nextInputNormLayer].inputNorm,
-                                         outputBuf, 0, rt->normBuffer, 0,
-                                         kNMOEHiddenDim, YES, 1e-6f)) return NO;
-            nextInputNormReady = YES;
-        }
+        if (!NMOEEncodeExpertPhase(cmd, rt, layer, expertBuffers, selectedCount, valid,
+                                   selectedValues, sharedGateScore, outputBuf, layerIndex,
+                                   &offsets, &nextInputNormReady)) return NO;
 
         [cmd commit];
         g_deferredExperts.active = YES;
         g_deferredExperts.gpuCombined = YES;
         g_deferredExperts.nextInputNormReady = nextInputNormReady;
-        g_deferredExperts.nextInputNormLayer = nextInputNormReady ? nextInputNormLayer : -1;
+        g_deferredExperts.nextInputNormLayer = nextInputNormReady ? layerIndex + 1 : -1;
         g_deferredExperts.cmdExperts = cmd;
         for (int i = 0; i < 8; ++i) {
             g_deferredExperts.expertBuffers[i] = i < (int)selectedCount ? expertBuffers[i] : nil;
@@ -3358,7 +3599,8 @@ static BOOL NMOELinearAttentionStepMetal(nmoe_runtime *rt,
 
 static void NMOEResetState(nmoe_runtime *rt) {
     if (rt == NULL || rt->backend == NULL) return;
-    NMOECancelDeferredExperts();
+    // Wait out any in-flight pipelined command buffer before resetting GPU state.
+    NMOEFinalizeDeferredExperts(rt);
     nmoe_backend_reset_linear_state(rt->backend);
     rt->sequencePosition = 0;
     rt->inThink = NO;
@@ -3496,6 +3738,11 @@ static uint32_t NMOEProcessToken(nmoe_runtime *rt, uint32_t token, BOOL computeL
             stats->expertFetch += layerStats.expertFetch;
             stats->expert += layerStats.expert;
             stats->contextSync += layerStats.contextSync;
+            stats->contextGpu += layerStats.contextGpu;
+            stats->contextDriver += layerStats.contextDriver;
+            stats->contextQueue += layerStats.contextQueue;
+            stats->contextCommitLag += layerStats.contextCommitLag;
+            stats->contextEndLag += layerStats.contextEndLag;
             stats->deferredWait += layerStats.deferredWait;
             double layerElapsed = NMOENowSeconds() - layerStart;
             stats->total += layerElapsed;
@@ -3601,10 +3848,22 @@ static uint32_t NMOEProcessPromptAndDecode(nmoe_runtime *rt, NSString *prompt, F
                 decodeMsPerToken,
                 decodeTokS);
         fprintf(stderr,
-                "timing: context_detail_avg_ms sync=%.3f deferred_wait=%.3f encode_cpu=%.3f\n",
+                "timing: context_detail_avg_ms sync=%.3f gpu_busy=%.3f driver_prep=%.3f queue_wait=%.3f commit_lag=%.3f end_lag=%.3f deferred_wait=%.3f encode_cpu=%.3f\n",
                 (perf.contextSync * 1000.0) / n,
+                (perf.contextGpu * 1000.0) / n,
+                (perf.contextDriver * 1000.0) / n,
+                (perf.contextQueue * 1000.0) / n,
+                (perf.contextCommitLag * 1000.0) / n,
+                (perf.contextEndLag * 1000.0) / n,
                 (perf.deferredWait * 1000.0) / n,
                 ((perf.context - perf.contextSync - perf.deferredWait) * 1000.0) / n);
+        if (g_deferredExpertGpuCount > 0) {
+            fprintf(stderr,
+                    "timing: deferred_expert_cmd_avg_ms gpu_busy=%.3f queue_wait=%.3f count=%zu\n",
+                    (g_deferredExpertGpuTotal * 1000.0) / (double)g_deferredExpertGpuCount,
+                    (g_deferredExpertQueueTotal * 1000.0) / (double)g_deferredExpertGpuCount,
+                    g_deferredExpertGpuCount);
+        }
         if (perf.fullLayerCount > 0 || perf.linearLayerCount > 0) {
             double fn = perf.fullLayerCount > 0 ? (double)perf.fullLayerCount : 1.0;
             double ln = perf.linearLayerCount > 0 ? (double)perf.linearLayerCount : 1.0;

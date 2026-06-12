@@ -152,6 +152,24 @@ struct NMOERouteSharedQ4Args {
     uint rows_per_tg;
 };
 
+// Fused QKV + Z + Beta + Alpha dequant matvec.
+// One dispatch processes all 4 projections that share the same input vector,
+// eliminating 3 redundant input loads and 3 kernel dispatches per layer.
+struct NMOELinearProjQ4Args {
+    uint qkv_rows;
+    uint z_rows;
+    uint beta_rows;
+    uint alpha_rows;
+    uint in_dim;
+    uint packed_cols;
+    uint group_size;
+    uint rows_per_tg;
+    uint qkv_tgs;
+    uint z_tgs;
+    uint beta_tgs;
+    uint alpha_tgs;
+};
+
 static inline float nmoe_bf16_to_f32(ushort value) {
     return as_type<float>((uint)value << 16);
 }
@@ -1091,6 +1109,90 @@ kernel void nmoe_dequant_row_q2(
 // Attention — ORIGINAL batched implementations (one thread per head)
 // ============================================================================
 
+// Fused single-pass decode attention (flash-decode style): one threadgroup per
+// Q head, online softmax, no intermediate scores/probs buffers. Replaces the
+// scores+softmax+values triple, whose one-thread-per-head loops made full
+// attention layers scale badly with sequence length. 8 simdgroups stripe the
+// KV positions; within a simdgroup each lane owns 8 dims (d = lane + 32*j) of
+// the 256-dim head, so K/V reads are coalesced.
+#define NMOE_ATTN_SIMDGROUPS 8u
+
+kernel void nmoe_attn_decode_fused(
+    const device float *q [[buffer(0)]],
+    const device float *k_cache [[buffer(1)]],
+    const device float *v_cache [[buffer(2)]],
+    device float *output [[buffer(3)]],
+    constant NMOEAttentionArgs &args [[buffer(4)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]])
+{
+    const uint head_dim = args.head_dim; // 256
+    const uint chunks = head_dim / 32u;  // dims per lane (8)
+    if (head >= args.full_heads || args.seq_len == 0 || head_dim == 0 || chunks > 8u) return;
+    uint kv_ratio = args.full_heads / max(args.full_kv_heads, 1u);
+    uint kv_head = head / max(kv_ratio, 1u);
+    const device float *q_head = q + head * args.q_stride;
+    const device float *q_gate = q_head + head_dim;
+    float inv_scale = args.inv_scale > 0.0f ? args.inv_scale : rsqrt((float)head_dim);
+
+    float qv[8];
+    for (uint j = 0; j < chunks; ++j) qv[j] = q_head[simd_lane + 32u * j];
+
+    // Online softmax accumulation. m starts at a large finite negative so
+    // exp(m - m_new) underflows cleanly to 0 under fast math (no inf-inf).
+    float m = -1e30f;
+    float l = 0.0f;
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint p = simd_group; p < args.seq_len; p += NMOE_ATTN_SIMDGROUPS) {
+        const device float *past_k = k_cache + p * args.cache_stride + kv_head * args.kv_stride;
+        float partial = 0.0f;
+        for (uint j = 0; j < chunks; ++j) {
+            partial = fma(qv[j], past_k[simd_lane + 32u * j], partial);
+        }
+        float s = simd_sum(partial) * inv_scale;
+        float m_new = max(m, s);
+        float c = exp(m - m_new);
+        float w = exp(s - m_new);
+        const device float *past_v = v_cache + p * args.cache_stride + kv_head * args.kv_stride;
+        for (uint j = 0; j < chunks; ++j) {
+            acc[j] = fma(w, past_v[simd_lane + 32u * j], acc[j] * c);
+        }
+        l = l * c + w;
+        m = m_new;
+    }
+
+    // Combine the 8 simdgroup partials.
+    threadgroup float tg_m[NMOE_ATTN_SIMDGROUPS];
+    threadgroup float tg_l[NMOE_ATTN_SIMDGROUPS];
+    threadgroup float tg_acc[NMOE_ATTN_SIMDGROUPS * 256u];
+    if (simd_lane == 0u) {
+        tg_m[simd_group] = m;
+        tg_l[simd_group] = l;
+    }
+    for (uint j = 0; j < chunks; ++j) {
+        tg_acc[simd_group * head_dim + simd_lane + 32u * j] = acc[j];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Each thread finalizes one output dim.
+    uint d = lid;
+    if (d >= head_dim) return;
+    float gm = tg_m[0];
+    for (uint i = 1; i < NMOE_ATTN_SIMDGROUPS; ++i) gm = max(gm, tg_m[i]);
+    float gl = 0.0f;
+    float val = 0.0f;
+    for (uint i = 0; i < NMOE_ATTN_SIMDGROUPS; ++i) {
+        float scale = exp(tg_m[i] - gm); // 0 for simdgroups that saw no positions
+        gl = fma(tg_l[i], scale, gl);
+        val = fma(tg_acc[i * head_dim + d], scale, val);
+    }
+    float inv_l = gl > 0.0f ? (1.0f / gl) : 0.0f;
+    device float *head_out = output + head * head_dim;
+    head_out[d] = val * inv_l * q_gate[d];
+}
+
 kernel void nmoe_attn_scores_batched(
     const device float *q [[buffer(0)]],
     const device float *k_cache [[buffer(1)]],
@@ -1766,4 +1868,116 @@ kernel void nmoe_gated_rms_norm(
     float gate = nmoe_silu(zval);
     float w = nmoe_bf16_to_f32(norm_weight[vi]);
     output[base + vi] = normed * gate * w;
+}
+
+// ============================================================================
+// Fused QKV + Z + Beta + Alpha dequant matvec — one dispatch, one input load.
+// ============================================================================
+
+kernel void nmoe_linear_proj_q4(
+    // QKV weights
+    const device uint *qkv_w [[buffer(0)]],
+    const device ushort *qkv_s [[buffer(1)]],
+    const device ushort *qkv_b [[buffer(2)]],
+    // Z weights
+    const device uint *z_w [[buffer(3)]],
+    const device ushort *z_s [[buffer(4)]],
+    const device ushort *z_b [[buffer(5)]],
+    // Beta weights
+    const device uint *beta_w [[buffer(6)]],
+    const device ushort *beta_s [[buffer(7)]],
+    const device ushort *beta_b [[buffer(8)]],
+    // Alpha weights
+    const device uint *alpha_w [[buffer(9)]],
+    const device ushort *alpha_s [[buffer(10)]],
+    const device ushort *alpha_b [[buffer(11)]],
+    // Shared input
+    const device float *input [[buffer(12)]],
+    // Outputs
+    device float *qkv_out [[buffer(13)]],
+    device float *z_out [[buffer(14)]],
+    device float *beta_out [[buffer(15)]],
+    device float *alpha_out [[buffer(16)]],
+    // Args
+    constant NMOELinearProjQ4Args &args [[buffer(17)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]])
+{
+    // Load input into shared memory once per TG (8 KB for in_dim=2048).
+    threadgroup float x_shared[2048];
+    uint in_dim = args.in_dim;
+    uint threads_per_tg = args.rows_per_tg * 32u;
+    for (uint i = lid; i < in_dim; i += threads_per_tg) {
+        x_shared[i] = input[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group >= args.rows_per_tg) return;
+
+    // Partition TGs across the 4 projections.
+    const device uint *packed_weight;
+    const device ushort *scales;
+    const device ushort *biases;
+    device float *output;
+    uint out_rows;
+    uint local_tgid;
+
+    if (tgid < args.qkv_tgs) {
+        local_tgid = tgid;
+        packed_weight = qkv_w; scales = qkv_s; biases = qkv_b;
+        output = qkv_out; out_rows = args.qkv_rows;
+    } else if (tgid < args.qkv_tgs + args.z_tgs) {
+        local_tgid = tgid - args.qkv_tgs;
+        packed_weight = z_w; scales = z_s; biases = z_b;
+        output = z_out; out_rows = args.z_rows;
+    } else if (tgid < args.qkv_tgs + args.z_tgs + args.beta_tgs) {
+        local_tgid = tgid - args.qkv_tgs - args.z_tgs;
+        packed_weight = beta_w; scales = beta_s; biases = beta_b;
+        output = beta_out; out_rows = args.beta_rows;
+    } else {
+        local_tgid = tgid - args.qkv_tgs - args.z_tgs - args.beta_tgs;
+        packed_weight = alpha_w; scales = alpha_s; biases = alpha_b;
+        output = alpha_out; out_rows = args.alpha_rows;
+    }
+
+    uint row = local_tgid * args.rows_per_tg + simd_group;
+    if (row >= out_rows || args.group_size == 0u) return;
+
+    uint packed_per_group = args.group_size / 8u;
+    uint scale_groups = args.in_dim / args.group_size;
+    const device uint *weight_row = packed_weight + row * args.packed_cols;
+    const device ushort *scale_row = scales + row * scale_groups;
+    const device ushort *bias_row = biases + row * scale_groups;
+
+    float acc = 0.0f;
+    for (uint pi = simd_lane; pi < args.packed_cols; pi += 32u) {
+        uint group = pi / packed_per_group;
+        float scale = nmoe_bf16_to_f32(scale_row[group]);
+        float bias  = nmoe_bf16_to_f32(bias_row[group]);
+        uint word = weight_row[pi];
+        uint x_base = pi * 8u;
+
+        float x0 = x_shared[x_base + 0u];
+        float x1 = x_shared[x_base + 1u];
+        float x2 = x_shared[x_base + 2u];
+        float x3 = x_shared[x_base + 3u];
+        float x4 = x_shared[x_base + 4u];
+        float x5 = x_shared[x_base + 5u];
+        float x6 = x_shared[x_base + 6u];
+        float x7 = x_shared[x_base + 7u];
+
+        acc += fma((float)((word >>  0u) & 0xFu), scale * x0, bias * x0);
+        acc += fma((float)((word >>  4u) & 0xFu), scale * x1, bias * x1);
+        acc += fma((float)((word >>  8u) & 0xFu), scale * x2, bias * x2);
+        acc += fma((float)((word >> 12u) & 0xFu), scale * x3, bias * x3);
+        acc += fma((float)((word >> 16u) & 0xFu), scale * x4, bias * x4);
+        acc += fma((float)((word >> 20u) & 0xFu), scale * x5, bias * x5);
+        acc += fma((float)((word >> 24u) & 0xFu), scale * x6, bias * x6);
+        acc += fma((float)((word >> 28u) & 0xFu), scale * x7, bias * x7);
+    }
+
+    float sum = simd_sum(acc);
+    if (simd_lane == 0u) output[row] = sum;
 }
