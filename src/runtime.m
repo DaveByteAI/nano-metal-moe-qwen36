@@ -2786,6 +2786,8 @@ static BOOL NMOEEncodeExpertPhase(id<MTLCommandBuffer> cmd,
                                   void *outputBuf,
                                   int layerIndex,
                                   const NMOEExpertOffsets *offsets,
+                                  id<MTLSharedEvent> downWaitEvent,
+                                  uint64_t downWaitValue,
                                   BOOL *outNextInputNormReady) {
     if (cmd == nil || rt == NULL || layer == NULL || expertBuffers == NULL ||
         selectedCount == 0 || outputBuf == NULL || offsets == NULL) return NO;
@@ -2818,6 +2820,9 @@ static BOOL NMOEEncodeExpertPhase(id<MTLCommandBuffer> cmd,
         id<MTLBuffer> expertActBatchMTL = (__bridge id<MTLBuffer>)g_expertIOExpertActBuf;
         if (!NMOEEncodeExpertGateUpQ4Batched(cmd, rt, expertBuffers, selectedCount,
                                               expertInputMTL, expertActBatchMTL, offsets)) return NO;
+        if (downWaitEvent != nil) {
+            [cmd encodeWaitForEvent:downWaitEvent value:downWaitValue];
+        }
         if (useFusedDownCombineQ4) {
             if (!NMOEEncodeExpertDownCombineQ4Tensor(cmd, rt, expertBuffers, selectedCount,
                                                      expertActBatchMTL, g_expertIOHMidBuf,
@@ -2922,11 +2927,14 @@ static BOOL NMOEPipelinedExpertTail(nmoe_runtime *rt,
 
     NMOEExpertOffsets offsets = *NMOEExpertOffsetsForBits(rt->quantBits);
     uint64_t ev = ++g_expertEventValue;
+    uint64_t dataWave1 = ++g_expertDataValue;
+    uint64_t dataWave2 = ++g_expertDataValue;
     [cmd encodeSignalEvent:evRoute value:ev];
-    [cmd encodeWaitForEvent:evData value:ev];
+    [cmd encodeWaitForEvent:evData value:dataWave1];
     BOOL nextInputNormReady = NO;
     if (!NMOEEncodeExpertPhase(cmd, rt, layer, expertBuffers, K, NULL, NULL, 0.0f,
-                               outputBuf, layerIndex, &offsets, &nextInputNormReady)) {
+                               outputBuf, layerIndex, &offsets,
+                               evData, dataWave2, &nextInputNormReady)) {
         return NO; // nothing committed yet — safe to bail
     }
     [cmd commit];
@@ -2937,7 +2945,7 @@ static BOOL NMOEPipelinedExpertTail(nmoe_runtime *rt,
     if (stats != NULL) stats->contextSync += NMOENowSeconds() - syncStart;
     if (stats != NULL) stats->context += NMOENowSeconds() - t0;
     if (!signaled) {
-        evData.signaledValue = ev; // unblock the GPU before bailing
+        evData.signaledValue = dataWave2; // unblock both waits before bailing
         return NO;
     }
 
@@ -2948,24 +2956,24 @@ static BOOL NMOEPipelinedExpertTail(nmoe_runtime *rt,
         ? NMOESelectRouteTopKCPU(rt, K, selectedIndices, selectedValues)
         : NMOEReadRouteTopKMetal(rt, K, selectedIndices, selectedValues);
     if (selectedCount == 0) {
-        evData.signaledValue = ev;
+        evData.signaledValue = dataWave2; // unblock both waits before bailing
         return NO;
     }
     if (stats != NULL) stats->route += NMOENowSeconds() - t1;
     float sharedGateScore = NMOEFloatBuffer(rt->sharedOutBuffer)[0];
 
-    // pread the selected experts into the fixed IO buffers (page-cache backed;
-    // mmapBase intentionally NULL to take the pread path)
-    t1 = NMOENowSeconds();
-    int valid[8] = {0};
-    NMOEAsyncReadExperts(expertFile->fd, NULL, selectedIndices, selectedCount,
-                         g_expertIOBuffers, valid);
-    if (stats != NULL) stats->expertFetch += NMOENowSeconds() - t1;
-
-    t1 = NMOENowSeconds();
-    memcpy(((__bridge id<MTLBuffer>)g_expertIOHMidBuf).contents, NMOEFloatBuffer(outputBuf), kNMOEHiddenDim * sizeof(float));
+    // Fill input buffer before wave 1 (gate_up kernel reads it)
     memcpy(((__bridge id<MTLBuffer>)g_expertIOInputBuf).contents, NMOEFloatBuffer(rt->normBuffer), kNMOEHiddenDim * sizeof(float));
 
+    // Wave 1: load gate+up weights [0, down_weight), then release GPU gate_up kernels
+    t1 = NMOENowSeconds();
+    int valid[8] = {0};
+    NMOEAsyncReadExpertsRange(expertFile->fd, NULL, selectedIndices, selectedCount,
+                              g_expertIOBuffers, valid, 0, offsets.down_weight);
+    evData.signaledValue = dataWave1; // GPU starts gate_up kernels
+
+    // Wave 2: while GPU runs gate_up, fill combine params + load down weights
+    memcpy(((__bridge id<MTLBuffer>)g_expertIOHMidBuf).contents, NMOEFloatBuffer(outputBuf), kNMOEHiddenDim * sizeof(float));
     float params[16];
     memset(params, 0, sizeof(params));
     for (size_t i = 0; i < selectedCount && i < 8; ++i) {
@@ -2973,7 +2981,12 @@ static BOOL NMOEPipelinedExpertTail(nmoe_runtime *rt,
     }
     params[8] = sharedGateScore;
     memcpy(paramsBuf.contents, params, sizeof(params));
-    evData.signaledValue = ev; // release the GPU's expert kernels
+    int valid2[8] = {0};
+    NMOEAsyncReadExpertsRange(expertFile->fd, NULL, selectedIndices, selectedCount,
+                              g_expertIOBuffers, valid2, offsets.down_weight,
+                              g_expertIOSize - offsets.down_weight);
+    if (stats != NULL) stats->expertFetch += NMOENowSeconds() - t1;
+    evData.signaledValue = dataWave2; // GPU starts down+combine kernels
 
     g_deferredExperts.active = YES;
     g_deferredExperts.gpuCombined = YES;
@@ -3233,7 +3246,7 @@ static BOOL NMOEFullAttentionStepMetal(nmoe_runtime *rt,
         BOOL nextInputNormReady = NO;
         if (!NMOEEncodeExpertPhase(cmd, rt, layer, expertBuffers, selectedCount, valid,
                                    selectedValues, sharedGateScore, outputBuf, layerIndex,
-                                   &offsets, &nextInputNormReady)) return NO;
+                                   &offsets, nil, 0, &nextInputNormReady)) return NO;
 
         [cmd commit];
         g_deferredExperts.active = YES;
@@ -3577,7 +3590,7 @@ static BOOL NMOELinearAttentionStepMetal(nmoe_runtime *rt,
         BOOL nextInputNormReady = NO;
         if (!NMOEEncodeExpertPhase(cmd, rt, layer, expertBuffers, selectedCount, valid,
                                    selectedValues, sharedGateScore, outputBuf, layerIndex,
-                                   &offsets, &nextInputNormReady)) return NO;
+                                   &offsets, nil, 0, &nextInputNormReady)) return NO;
 
         [cmd commit];
         g_deferredExperts.active = YES;
