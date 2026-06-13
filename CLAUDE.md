@@ -56,7 +56,7 @@ Then encode it from `runtime.m` via `nmoe_backend_pipeline_state()` and the `NMO
 
 ### Experiment toggles (env vars, read in runtime.m)
 
-`NMOE_PIPELINE` (default on — SharedEvent expert pipeline; set 0 for the legacy per-layer waitUntilCompleted path), `NMOE_CPU_ROUTER`, `NMOE_GPU_ROUTED_EXPERTS`, `NMOE_COPY_EXPERTS`, `NMOE_FUSED_DOWN_COMBINE_Q4`, `NMOE_EXPERT_ROWS_PER_TG`, `NMOE_MATVEC_ROWS_PER_TG`.
+`NMOE_PIPELINE` (default on — SharedEvent expert pipeline; set 0 for the legacy per-layer waitUntilCompleted path), `NMOE_FUSED_ATTN` (default on — fused single-kernel decode attention for full-attention layers; set 0 for the old 3-kernel scores/softmax/values path), `NMOE_CPU_ROUTER`, `NMOE_GPU_ROUTED_EXPERTS` (⚠️ never use on 16GB — wires 600MB Metal buffers), `NMOE_COPY_EXPERTS`, `NMOE_FUSED_DOWN_COMBINE_Q4`, `NMOE_EXPERT_ROWS_PER_TG`, `NMOE_MATVEC_ROWS_PER_TG`.
 
 ### SharedEvent expert pipeline (default path)
 
