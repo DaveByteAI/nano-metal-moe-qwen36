@@ -120,6 +120,9 @@ qwen36_35b/
   packed_experts/
     layer_00.bin ... layer_39.bin
     layout.json
+  packed_experts_q3/          # recommended on 16GB, used by --q3 (auto prefers it)
+    layer_00.bin ... layer_39.bin
+    layout.json
   packed_experts_2bit/        # optional, used by --q2
     layer_00.bin ... layer_39.bin
     layout.json
@@ -188,6 +191,30 @@ python3 scripts/convert_qwen36.py \
   --skip-tokenizer
 ```
 
+### q3 experts (recommended on 16GB machines)
+
+The q4 expert pack is 18GB, larger than a 16GB Mac's RAM, so many expert reads
+miss the page cache and hit the SSD (~2.8GB/s on a Mac mini). The q3 pack is
+13GB (1.38MB per expert instead of 1.77MB): more of it stays cached and every
+miss moves fewer bytes. It is derived from the q4 pack (no original checkpoint
+needed); the requantizer uses a clip search plus a least-squares refit of each
+group's scale/bias:
+
+```bash
+python3 scripts/requant_experts.py --src qwen36_35b/packed_experts \
+  --dst qwen36_35b/packed_experts_q3 --bits 3 --container q3   # ~15 min on M4
+```
+
+Measured on an M4 Mac mini 16GB (128-token decode, `scripts/eval/mixed.txt` perplexity):
+
+| experts | decode tok/s | page-cache hit | ppl | KL vs q4 |
+|---|---|---|---|---|
+| q4, K=8 | 6.7 | 78% | 5.64 | — |
+| **q3, K=8** | **9.0** | 85% | 5.59 | 0.029 |
+| q4, K=6 | — | — | 6.13 | 0.039 |
+
+When `packed_experts_q3/` exists, `--quant auto` (the default) selects it.
+
 If you already have a converted package elsewhere, symlink it:
 
 ```bash
@@ -201,12 +228,22 @@ ln -s /path/to/qwen36_35b qwen36_35b
 ./nmoe ask "请用中文介绍本地大模型推理" --q2 --experts 8 --tokens 128 --timing
 ./nmoe chat --q4 --experts 8 --tokens 512
 ./nmoe bench "请介绍一下量子计算" --q2 --experts 6 --tokens 128 --timing --quiet
+./nmoe ppl scripts/eval/mixed.txt --q3          # teacher-forced perplexity / accuracy check
+```
+
+To compare the accuracy of two configurations, save their predictions and diff
+them (KL divergence, top-1 agreement, ΔNLL):
+
+```bash
+NMOE_PPL_DUMP=/tmp/q4.bin ./nmoe ppl scripts/eval/mixed.txt --q4
+NMOE_PPL_DUMP=/tmp/q3.bin ./nmoe ppl scripts/eval/mixed.txt --q3
+python3 scripts/ppl_compare.py /tmp/q4.bin /tmp/q3.bin
 ```
 
 Useful options:
 
 - `--model PATH`: model package directory, default `qwen36_35b`
-- `--q2` / `--q4` / `--quant auto|2|4`: expert quantization mode
+- `--q2` / `--q3` / `--q4` / `--quant auto|2|3|4`: expert quantization mode (auto prefers q3)
 - `--experts N`: active experts per layer, 1..8
 - `--tokens N`: generation limit
 - `--think N`: force `</think>` after N thinking tokens, `0` disables forcing

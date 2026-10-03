@@ -1,0 +1,20 @@
+本地大模型推理的核心挑战在于内存带宽。对于混合专家模型来说，每个 token 只会激活一小部分专家，因此真正需要读取的权重远小于模型的总参数量。如果能够把常用的专家留在内存里，把不常用的专家放在固态硬盘上按需读取，就可以在一台只有十六 GB 内存的电脑上运行三百五十亿参数的模型。当然，这种做法也有代价：当页缓存命中率下降时，生成速度会明显变慢。
+
+The French Revolution began in 1789 and transformed the political landscape of Europe. Its ideals of liberty, equality, and fraternity inspired movements far beyond France, although the revolution itself descended into violence during the Reign of Terror. Historians still debate whether the upheaval was driven mainly by economic hardship, by Enlightenment philosophy, or by the fiscal collapse of the monarchy.
+
+def binary_search(items, target):
+    lo, hi = 0, len(items) - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if items[mid] == target:
+            return mid
+        if items[mid] < target:
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return -1
+
+{"name": "get_weather", "arguments": {"city": "Hangzhou", "unit": "celsius", "days": 3}}
+
+问题：一个水池有两个进水管，甲管单独注满需要6小时，乙管单独注满需要3小时。两管同时打开，需要多少小时注满？
+解答：甲管每小时注满水池的六分之一，乙管每小时注满三分之一，合起来每小时注满二分之一，所以需要2小时。

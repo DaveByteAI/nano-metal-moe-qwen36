@@ -49,7 +49,9 @@ typedef enum nmoe_backend_kernel_kind {
     NMOE_BACKEND_KERNEL_FULL_QK_PREP = 35,
     NMOE_BACKEND_KERNEL_LINEAR_PROJ_Q4 = 36,
     NMOE_BACKEND_KERNEL_ATTN_DECODE_FUSED = 37,
-    NMOE_BACKEND_KERNEL_COUNT = 38,
+    NMOE_BACKEND_KERNEL_EXPERT_GATE_UP_Q3_BATCHED = 38,
+    NMOE_BACKEND_KERNEL_EXPERT_DOWN_COMBINE_Q3 = 39,
+    NMOE_BACKEND_KERNEL_COUNT = 40,
 } nmoe_backend_kernel_kind;
 
 nmoe_backend *nmoe_backend_create(int quiet);

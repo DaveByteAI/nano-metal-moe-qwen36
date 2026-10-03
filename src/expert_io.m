@@ -13,6 +13,7 @@
 
 typedef NS_ENUM(NSUInteger, NMMExpertQuantBits) {
     NMMExpertQuantBitsQ2 = 2,
+    NMMExpertQuantBitsQ3 = 3,
     NMMExpertQuantBitsQ4 = 4,
 };
 
@@ -93,6 +94,8 @@ static size_t NMMActiveExpertSizeForBits(NMMExpertQuantBits bits) {
             return 1769472;
         case NMMExpertQuantBitsQ2:
             return 983040;
+        case NMMExpertQuantBitsQ3:
+            return 1376256;
         default:
             return 0;
     }
@@ -511,7 +514,7 @@ nmoe_expert_store *nmoe_expert_store_open(const char *model_path, int quant_bits
         return NULL;
     }
 
-    int effective_bits = (quant_bits == 2) ? 2 : 4;
+    int effective_bits = (quant_bits == 2 || quant_bits == 3) ? quant_bits : 4;
 
     nmoe_expert_store *store = calloc(1, sizeof(*store));
     if (store == NULL) {
@@ -548,7 +551,7 @@ void nmoe_expert_store_close(nmoe_expert_store *store) {
 }
 
 size_t nmoe_expert_active_size(int quant_bits) {
-    int effective_bits = (quant_bits == 2) ? 2 : 4;
+    int effective_bits = (quant_bits == 2 || quant_bits == 3) ? quant_bits : 4;
     return NMMExpertActiveSizeForBits((NSUInteger)effective_bits);
 }
 

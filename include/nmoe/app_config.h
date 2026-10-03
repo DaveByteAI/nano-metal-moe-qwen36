@@ -9,6 +9,7 @@ typedef enum {
     NMOE_RUN_ASK = 0,
     NMOE_RUN_CHAT = 1,
     NMOE_RUN_BENCH = 2,
+    NMOE_RUN_PPL = 3,
 } nmoe_run_mode;
 
 typedef struct {
@@ -19,7 +20,7 @@ typedef struct {
     int max_tokens;
     int tokens_set;
     int experts;
-    int quant_bits; /* 0 auto, 2 q2, 4 q4 */
+    int quant_bits; /* 0 auto, 2 q2, 3 q3, 4 q4 */
     int think_budget;
     int timing;
     int quiet;
