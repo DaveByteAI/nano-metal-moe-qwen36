@@ -1,275 +1,211 @@
 # nano-metal-moe-qwen36
 
-`nmoe` is a compact Apple Silicon Metal runtime for local Qwen3.6-35B-A3B
-inference on a base Mac mini with 16GB unified memory. The public tree is kept
-small: one command-line binary, the Metal kernels, and a model conversion
-script.
+**English** | [简体中文](README.zh-CN.md)
 
-The core idea is to keep the shared model weights resident while treating the
-routed MoE experts as quantized external packs. Each layer selects only the
-top-k experts needed for the current token, then loads and runs just those
-expert weights instead of keeping all 256 experts hot in memory. q4 and q2
-expert packs reduce bandwidth and storage pressure further, which is what makes
-this setup practical on a 16GB machine.
+Run **Qwen3.6-35B-A3B**, a 35-billion-parameter Mixture-of-Experts model, on a
+**base Mac mini with 16GB of RAM**, at about 9 tokens/second.
 
-## Architecture
+`nmoe` is a single native binary written in Objective-C and Metal. Python,
+servers, and ML frameworks are only used to prepare the model, never at
+inference time. Shared weights stay resident in memory. The 256 routed experts
+per layer stay on the SSD, and each token loads only the 8 experts the router
+picks.
 
-```text
-Hugging Face: Qwen/Qwen3.6-35B-A3B
-        |
-        v
-scripts/convert_qwen36.py
-BF16 safetensors -> nmoe runtime package
-        |
-        +--> model_weights.bin/json
-        |    shared non-expert tensors
-        |    mmap + Metal buffer
-        |
-        +--> tokenizer.bin + vocab.bin
-        |    prompt encode / token decode
-        |
-        +--> packed_experts/
-             q4 or q2 routed expert packs
-             40 layers x 256 experts
-
-Runtime path
-------------
-
-ask / chat / bench
-        |
-        v
-Tokenizer
-prompt encode using tokenizer.bin + vocab.bin
-        |
-        v
-nmoe runtime
-40-layer Qwen3.6 MoE decode loop
-        |
-        +--> shared weights resident
-        |    model_weights.bin/json
-        |         |
-        |         v
-        |    Metal kernels
-        |    attention + shared expert
-        |
-        +--> GPU router
-        |    select top-k experts per layer
-        |         |
-        |         v
-        |    expert loader
-        |    read only selected expert packs
-        |    from packed_experts/
-        |         |
-        |         v
-        |    Metal kernels
-        |    routed expert
-        |
-        v
-generated tokens
-        |
-        v
-Tokenizer
-decode using tokenizer.bin + vocab.bin
-        |
-        v
-output text
+```
+$ ./nmoe ask "Explain the difference between prefill and decode in one paragraph."
 ```
 
-What makes this project different:
+## Highlights
 
-- It keeps the shared Qwen3.6 tensors resident, but leaves routed experts in
-  compact per-layer packs.
-- Each token activates only the top-k routed experts, so the runtime reads and
-  runs a tiny fraction of the 256 experts per layer.
-- The hot path is a single native Objective-C/Metal binary, with no Python or
-  server process in the inference loop.
-- The same model package can carry q4 experts for quality or q2 experts for
-  lower bandwidth experiments.
+- **35B model on a 16GB machine.** Shared weights are about 1.4GB and stay
+  resident. The routed experts (13–18GB) live on the SSD and are streamed on
+  demand. Only about 3B parameters are active per token.
+- **q3 expert pack, the recommended setup for 16GB.** A 3-bit requantization
+  of the experts is 13GB instead of 18GB. More of it stays in the page cache,
+  so decode is **+35% faster** than q4 with no measurable accuracy loss.
+- **Pipelined decode.** Each layer is one command buffer. The GPU signals a
+  `MTLSharedEvent` when routing is ready, the CPU preads the chosen experts,
+  and the GPU starts on the gate/up projections while the down weights are
+  still loading.
+- **Batched prompt prefill.** Prompt tokens are processed 32 at a time. Expert
+  reads overlap with GPU work, and each expert is read once per chunk instead
+  of once per token. The output is bit-identical to token-by-token processing.
+- **Multi-turn chat.** The conversation is kept in the KV cache and the
+  linear-attention state, so earlier turns are never recomputed.
+- **Built-in accuracy checks.** `nmoe ppl` measures perplexity, and
+  `scripts/ppl_compare.py` reports KL divergence and top-1 agreement between
+  two configurations. Speedups are measured against accuracy, not judged by
+  eye.
 
-## What Is Included
+## Performance
 
-- `ask`, `chat`, and `bench` commands
-- Support for q4 and q2 routed expert packs
-- Metal kernels for the runtime hot path
-- A Python converter for Hugging Face safetensors into the runtime package
+Apple M4 Mac mini, 16GB, macOS 26, with a normal desktop workload running
+(browser, terminal):
 
-Model weights are not part of this repository. This repo expects a converted
-runtime package made from the Hugging Face checkpoint
-`Qwen/Qwen3.6-35B-A3B`.
+| Expert pack | Decode | Prompt prefill | Perplexity ¹ | KL vs q4 ¹ |
+|---|---|---|---|---|
+| q4 (18GB) | 6.8 tok/s | ~10 tok/s | 5.64 | — |
+| **q3 (13GB), default** | **9.0 tok/s** | **15–21 tok/s** | **5.59** | 0.029 |
 
-## Build
+¹ Teacher-forced on [`scripts/eval/mixed.txt`](scripts/eval/mixed.txt), 364
+tokens of mixed Chinese, English, code, and JSON. Lower perplexity is better.
+KL is measured against the q4 output distribution.
+
+Speed depends on how much of the expert pack stays in the page cache, so it
+drops when other apps use a lot of memory. Decode reads about 11MB of experts
+per layer, and a cache miss is served from the SSD at about 2.8GB/s. The
+[optimization log](docs/optimization-log.zh-CN.md) (in Chinese) explains where
+every millisecond goes.
+
+## Requirements
+
+- An Apple Silicon Mac. 16GB of RAM is enough; more memory makes it faster.
+- macOS with Metal, and the Xcode Command Line Tools (`xcode-select --install`).
+- Disk space: about 20GB for the q4 runtime package plus 13GB for the q3 pack.
+  The original BF16 checkpoint (~70GB) is only needed during conversion and
+  can be deleted afterwards.
+- Python 3 for model preparation only: `numpy` and `huggingface_hub`, plus
+  `torch` for the q3 requantizer.
+
+## Quick start
+
+### 1. Build
 
 ```bash
-make
+make            # produces ./nmoe
 ```
 
-The binary is written to `./nmoe`.
+Metal kernels are compiled at runtime from `metal/kernels.metal`, so run
+`./nmoe` from the repository root.
 
-## Model Layout
+### 2. Get the model and convert it
 
-By default the runtime looks for `qwen36_35b/`. In this working copy that path
-may be a symlink to another converted package; for a fresh checkout you can
-either create the directory directly or symlink it yourself.
+```bash
+python3 -m pip install -U huggingface_hub numpy torch
+
+# Download the official BF16 checkpoint (outside this repo)
+hf download Qwen/Qwen3.6-35B-A3B --local-dir ../model/Qwen3.6-35B-A3B
+# (older huggingface_hub: huggingface-cli download ... --local-dir ...)
+
+# Convert to the runtime package: shared weights, tokenizer, q4 experts
+python3 scripts/convert_qwen36.py \
+  --model ../model/Qwen3.6-35B-A3B --output qwen36_35b --bits 4
+
+# Recommended on 16GB machines: derive the q3 expert pack (~15 min on an M4)
+python3 scripts/requant_experts.py \
+  --src qwen36_35b/packed_experts --dst qwen36_35b/packed_experts_q3 \
+  --bits 3 --container q3
+```
+
+The resulting package looks like this:
 
 ```text
 qwen36_35b/
-  model_weights.bin
-  model_weights.json
-  tokenizer.bin
-  vocab.bin
-  packed_experts/
-    layer_00.bin ... layer_39.bin
-    layout.json
-  packed_experts_q3/          # recommended on 16GB, used by --q3 (auto prefers it)
-    layer_00.bin ... layer_39.bin
-    layout.json
-  packed_experts_2bit/        # optional, used by --q2
-    layer_00.bin ... layer_39.bin
-    layout.json
+  model_weights.bin, model_weights.json   # shared (non-expert) tensors, mmap'd
+  tokenizer.bin, vocab.bin
+  packed_experts/        layer_00..39.bin  # q4 experts (18GB)
+  packed_experts_q3/     layer_00..39.bin  # q3 experts (13GB), picked by default
 ```
 
-You can also pass a model directory explicitly:
+If the package lives somewhere else, symlink it with
+`ln -s /path/to/qwen36_35b qwen36_35b`, or pass `--model PATH`.
+
+### 3. Run
 
 ```bash
-./nmoe ask "你好" --model /path/to/qwen36_35b
+./nmoe ask "Explain KV cache in two sentences."
+./nmoe chat                                   # multi-turn; /reset clears the conversation
+./nmoe bench "Introduce quantum computing" --tokens 128 --timing --quiet
 ```
 
-## Download And Convert The Model
+## Usage
 
-Use the official Hugging Face model:
+| Command | What it does |
+|---|---|
+| `nmoe ask "PROMPT"` | One question, one streamed answer |
+| `nmoe chat` | Interactive multi-turn chat; `/reset` starts over |
+| `nmoe bench "PROMPT"` | Like `ask`; use with `--timing --quiet` for speed numbers |
+| `nmoe ppl FILE` | Teacher-forced perplexity and top-1 accuracy over a text file |
 
-- Model repo: `Qwen/Qwen3.6-35B-A3B`
-- Runtime package name used by this repo: `qwen36_35b`
-- The converter expects the original BF16 `model-*.safetensors` shards plus
-  `tokenizer.json`.
+| Option | Default | Meaning |
+|---|---|---|
+| `--model PATH` | `qwen36_35b` | Runtime package directory |
+| `--quant auto\|2\|3\|4`, `--q2`/`--q3`/`--q4` | `auto` | Expert pack; `auto` picks q3 if present, otherwise q4 |
+| `--experts N` | 8 | Routed experts per token (1–8); fewer is faster but less accurate |
+| `--tokens N` | 256 (chat: 512) | Generation limit |
+| `--think N` | 1 | Force `</think>` after N thinking tokens; `0` lets the model think freely |
+| `--timing` | off | Print per-layer timing, decode and prefill speed |
+| `--quiet` | off | Do not stream tokens |
 
-Install the download/conversion dependencies:
+### Choosing an expert pack
 
-```bash
-python3 -m pip install -U huggingface_hub numpy
-```
+| Pack | Size | Speed on 16GB | Accuracy |
+|---|---|---|---|
+| q4 | 18GB | baseline | reference |
+| **q3** | 13GB | +35% decode | same as q4 within noise (KL 0.029) |
+| q2 | 10GB | fastest | not evaluated here; 2-bit is expected to lose quality. Experimental (`convert_qwen36.py --bits 2`) |
 
-Download the HF checkpoint. The model is large, so keep it outside git:
+Reducing `--experts` is a worse trade than q3. For example, `--experts 6`
+raises perplexity by about 9% (KL 0.039).
 
-```bash
-mkdir -p ../model
-hf download Qwen/Qwen3.6-35B-A3B \
-  --local-dir ../model/Qwen3.6-35B-A3B
-```
+## Checking accuracy
 
-If your `huggingface_hub` install does not provide the `hf` command, use:
-
-```bash
-huggingface-cli download Qwen/Qwen3.6-35B-A3B \
-  --local-dir ../model/Qwen3.6-35B-A3B
-```
-
-Convert the downloaded checkpoint into the runtime layout:
-
-```bash
-python3 scripts/convert_qwen36.py \
-  --model ../model/Qwen3.6-35B-A3B \
-  --output qwen36_35b \
-  --bits 4
-```
-
-That command writes:
-
-- `model_weights.bin` and `model_weights.json` for non-expert tensors
-- `tokenizer.bin` and `vocab.bin`
-- `packed_experts/` for q4 routed experts
-
-To additionally create q2 experts, reuse the already generated shared weights
-and tokenizer files:
-
-```bash
-python3 scripts/convert_qwen36.py \
-  --model ../model/Qwen3.6-35B-A3B \
-  --output qwen36_35b \
-  --bits 2 \
-  --skip-weights \
-  --skip-tokenizer
-```
-
-### q3 experts (recommended on 16GB machines)
-
-The q4 expert pack is 18GB, larger than a 16GB Mac's RAM, so many expert reads
-miss the page cache and hit the SSD (~2.8GB/s on a Mac mini). The q3 pack is
-13GB (1.38MB per expert instead of 1.77MB): more of it stays cached and every
-miss moves fewer bytes. It is derived from the q4 pack (no original checkpoint
-needed); the requantizer uses a clip search plus a least-squares refit of each
-group's scale/bias:
-
-```bash
-python3 scripts/requant_experts.py --src qwen36_35b/packed_experts \
-  --dst qwen36_35b/packed_experts_q3 --bits 3 --container q3   # ~15 min on M4
-```
-
-Measured on an M4 Mac mini 16GB (128-token decode, `scripts/eval/mixed.txt` perplexity):
-
-| experts | decode tok/s | page-cache hit | ppl | KL vs q4 |
-|---|---|---|---|---|
-| q4, K=8 | 6.7 | 78% | 5.64 | — |
-| **q3, K=8** | **9.0** | 85% | 5.59 | 0.029 |
-| q4, K=6 | — | — | 6.13 | 0.039 |
-
-When `packed_experts_q3/` exists, `--quant auto` (the default) selects it.
-
-If you already have a converted package elsewhere, symlink it:
-
-```bash
-ln -s /path/to/qwen36_35b qwen36_35b
-```
-
-## Run
-
-```bash
-./nmoe ask "解释一下 KV cache 和 prefill/decode 的区别" --q4 --experts 8 --tokens 128
-./nmoe ask "请用中文介绍本地大模型推理" --q2 --experts 8 --tokens 128 --timing
-./nmoe chat --q4 --experts 8 --tokens 512      # multi-turn; type /reset to clear the conversation
-./nmoe bench "请介绍一下量子计算" --q2 --experts 6 --tokens 128 --timing --quiet
-./nmoe ppl scripts/eval/mixed.txt --q3          # teacher-forced perplexity / accuracy check
-```
-
-To compare the accuracy of two configurations, save their predictions and diff
-them (KL divergence, top-1 agreement, ΔNLL):
+Any change that can affect numerics (quantization, routing, kernels) should be
+checked against a baseline:
 
 ```bash
 NMOE_PPL_DUMP=/tmp/q4.bin ./nmoe ppl scripts/eval/mixed.txt --q4
 NMOE_PPL_DUMP=/tmp/q3.bin ./nmoe ppl scripts/eval/mixed.txt --q3
-python3 scripts/ppl_compare.py /tmp/q4.bin /tmp/q3.bin
+python3 scripts/ppl_compare.py /tmp/q4.bin /tmp/q3.bin   # top-1 agreement, KL, ΔNLL
 ```
 
-Useful options:
+## How it works
 
-- `--model PATH`: model package directory, default `qwen36_35b`
-- `--q2` / `--q3` / `--q4` / `--quant auto|2|3|4`: expert quantization mode (auto prefers q3)
-- `--experts N`: active experts per layer, 1..8
-- `--tokens N`: generation limit
-- `--think N`: force `</think>` after N thinking tokens, `0` disables forcing
-- `--timing`: print runtime timing
-- `--quiet`: suppress token streaming
+Each token passes through 40 layers. Thirty are GatedDeltaNet linear attention
+and every fourth is full attention with a KV cache. The per-layer decode
+pipeline is shown below; prefill runs the same steps for 32 tokens at a time.
 
-## Convert Experts Only
-
-For expert-only refreshes, skip the shared weights and tokenizer. This is useful
-when `model_weights.bin`, `model_weights.json`, `tokenizer.bin`, and `vocab.bin`
-already exist:
-
-```bash
-python3 scripts/convert_qwen36.py \
-  --model ../model/Qwen3.6-35B-A3B \
-  --output qwen36_35b \
-  --bits 4 \
-  --skip-weights \
-  --skip-tokenizer
-
-python3 scripts/convert_qwen36.py \
-  --model ../model/Qwen3.6-35B-A3B \
-  --output qwen36_35b \
-  --bits 2 \
-  --skip-weights \
-  --skip-tokenizer
+```text
+GPU  norm → attention → router + shared expert ─┬─▶ [wait] gate/up ─▶ [wait] down + combine ─▶ next layer
+                                                 │         ▲                 ▲
+CPU                                    top-k (8 of 256)    │                 │
+                                         pread gate+up ────┘                 │
+                                         pread down (overlaps GPU gate/up) ──┘
 ```
 
-Python dependencies for downloading/conversion: `huggingface_hub` and `numpy`.
+- **Shared weights** (`model_weights.bin`, q4) are mmap'd once and wrapped as
+  a Metal buffer.
+- **Routed experts** live in one file per layer and are read with parallel
+  `pread` into fixed buffers, about 1.4MB per expert at q3. The OS page cache
+  is the only expert cache.
+- **Expert kernels are encoded before routing is known.** Routing weights
+  reach the GPU through a buffer, and `MTLSharedEvent`s gate execution, so the
+  CPU never waits for a layer's command buffer to finish.
+
+## Repository layout
+
+```text
+src/runtime.m            model, decode/prefill pipeline, ask/chat/bench/ppl
+src/backend/             Metal device, pipelines, buffers
+src/expert_io.m          expert pack layout and I/O
+src/tokenizer.m          BPE tokenizer
+metal/kernels.metal      all GPU kernels (compiled at runtime)
+include/nmoe/            public C headers
+scripts/convert_qwen36.py   HF safetensors -> runtime package (q4/q2)
+scripts/requant_experts.py  q4 experts -> q3 experts
+scripts/ppl_compare.py      compare two `nmoe ppl` dumps
+scripts/*_bench.*           micro-benchmarks (matvec, pread)
+docs/optimization-log.zh-CN.md   detailed optimization log (Chinese)
+```
+
+## Further reading
+
+- [Optimization log](docs/optimization-log.zh-CN.md) (Chinese): measurements,
+  experiments that worked and those that did not, and why.
+- [CLAUDE.md](CLAUDE.md): architecture notes for contributors, including how
+  to add a Metal kernel, the pipeline invariants, and the experiment
+  environment variables.
+
+Model weights are not included. They come from
+[Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) and are
+subject to its license.

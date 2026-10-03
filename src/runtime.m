@@ -1508,7 +1508,7 @@ static BOOL NMOEUseFusedDownCombineQ4(void) {
 // until the whole wave-1 read completes. q4 pipelined mode only. Default off:
 // measured neutral (±2%), because GPU expert compute (~0.2-0.3ms/layer) is far
 // smaller than the CPU pread wall, so releasing the GPU early does not shorten
-// the critical path (see 优化.md 2026-07-05).
+// the critical path (see docs/optimization-log.zh-CN.md, 2026-07-05).
 static BOOL NMOEUseIncrementalGateUp(void) {
     const char *value = getenv("NMOE_INCREMENTAL_GATEUP");
     if (value == NULL || value[0] == '\0') return NO;
