@@ -202,9 +202,6 @@ docs/optimization-log.zh-CN.md   detailed optimization log (Chinese)
 
 - [Optimization log](docs/optimization-log.zh-CN.md) (Chinese): measurements,
   experiments that worked and those that did not, and why.
-- [CLAUDE.md](CLAUDE.md): architecture notes for contributors, including how
-  to add a Metal kernel, the pipeline invariants, and the experiment
-  environment variables.
 
 ## License
 

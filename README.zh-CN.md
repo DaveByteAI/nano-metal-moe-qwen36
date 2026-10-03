@@ -178,8 +178,6 @@ docs/optimization-log.zh-CN.md   详细优化记录
 ## 延伸阅读
 
 - [优化记录](docs/optimization-log.zh-CN.md)：各项测量数据，哪些实验有效、哪些无效，以及原因。
-- [CLAUDE.md](CLAUDE.md)（英文）：面向贡献者的架构说明，包括如何新增 Metal kernel、
-  流水线必须遵守的约束，以及实验用的环境变量。
 
 ## 许可证
 

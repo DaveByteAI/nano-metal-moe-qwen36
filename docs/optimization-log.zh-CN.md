@@ -93,7 +93,7 @@ M4 理论带宽约 120 GB/s，实际有效利用仅 ~3%。差距来自 dequant m
 
 - 需要修改 `scripts/convert_qwen36.py` 支持 q2 输出
 - 需要修改 `NMOEEncodeDequantMatVecTensor` 支持 q2 路径
-- q2 可能导致质量下降（参考 CLAUDE.md 中 expert q2 的经验）
+- q2 可能导致质量下降（2-bit 专家在更大的 MoE 上曾导致 JSON/工具调用输出出错）
 
 ### 优先级 2: 多 token 批处理 (Prefill 优化)
 
