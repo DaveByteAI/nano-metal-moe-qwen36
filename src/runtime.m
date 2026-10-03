@@ -4465,14 +4465,15 @@ static BOOL NMOEPrefillTokens(nmoe_runtime *rt, const uint32_t *tokens, int coun
     return YES;
 }
 
-static uint32_t NMOEProcessPromptAndDecode(nmoe_runtime *rt, NSString *prompt, FILE *output, BOOL quiet, BOOL timing, int maxTokens, NMOEPerfStats *perfOut) {
-    if (rt == NULL || prompt.length == 0) return 0;
-    uint32_t tokenBuffer[4096];
-    int tokenCount = nmoe_tokenizer_encode(rt->tokenizer, prompt.UTF8String, tokenBuffer, 4096);
-    if (tokenCount <= 0) return 0;
+// Feed `tokenCount` tokens at the current sequence position (no reset), then
+// generate up to maxTokens. Returns the last predicted token, which has NOT
+// been fed into the model (EOS, or the token that hit the limit), or
+// UINT32_MAX when maxTokens <= 0 (prefill only).
+static uint32_t NMOEDecodeTokens(nmoe_runtime *rt, const uint32_t *tokenBuffer, int tokenCount, FILE *output, BOOL quiet, BOOL timing, int maxTokens, NMOEPerfStats *perfOut) {
+    if (rt == NULL || tokenBuffer == NULL || tokenCount <= 0) return 0;
     NMOETracePromptTokens(rt, tokenBuffer, tokenCount);
     double startTime = NMOENowSeconds();
-    rt->sequencePosition = 0; rt->inThink = NO; rt->thinkCount = 0;
+    rt->inThink = NO; rt->thinkCount = 0;
     NMOEPerfStats perf = {0};
     if (maxTokens <= 0) { (void)NMOEPrefillTokens(rt, tokenBuffer, tokenCount, &perf); if (perfOut) *perfOut = perf; return UINT32_MAX; }
     (void)NMOEPrefillTokens(rt, tokenBuffer, tokenCount - 1, &perf);
@@ -4564,6 +4565,15 @@ static uint32_t NMOEProcessPromptAndDecode(nmoe_runtime *rt, NSString *prompt, F
     }
     if (perfOut) *perfOut = perf;
     return nextToken;
+}
+
+static uint32_t NMOEProcessPromptAndDecode(nmoe_runtime *rt, NSString *prompt, FILE *output, BOOL quiet, BOOL timing, int maxTokens, NMOEPerfStats *perfOut) {
+    if (rt == NULL || prompt.length == 0) return 0;
+    static uint32_t tokenBuffer[4096];
+    int tokenCount = nmoe_tokenizer_encode(rt->tokenizer, prompt.UTF8String, tokenBuffer, 4096);
+    if (tokenCount <= 0) return 0;
+    rt->sequencePosition = 0;
+    return NMOEDecodeTokens(rt, tokenBuffer, tokenCount, output, quiet, timing, maxTokens, perfOut);
 }
 
 // Teacher-forced evaluation over a raw text file (no chat template). Reports
@@ -4703,17 +4713,61 @@ int nmoe_runtime_run(nmoe_runtime *rt) {
     return 0;
 }
 
-static int NMOERunChat(nmoe_runtime *rt) {
-    NSString *systemPrompt = NMOEChatSystemPrompt();
+// Multi-turn chat: the system prompt is prefilled once and every turn is
+// appended to the same KV/linear state, so the model sees the whole
+// conversation. The last generated token of a turn (EOS or the token that hit
+// the limit) has not been fed yet; it is fed at the start of the next turn
+// together with the <|im_end|> that closes the assistant message. When the
+// context would overflow, the conversation restarts. "/reset" clears it.
+static int NMOEChatPrefillSystem(nmoe_runtime *rt, uint32_t *tokens, int capacity) {
     NMOEResetState(rt);
-    (void)NMOEProcessPromptAndDecode(rt, systemPrompt, stdout, YES, NO, 0, NULL);
+    int n = nmoe_tokenizer_encode(rt->tokenizer, NMOEChatSystemPrompt().UTF8String, tokens, capacity);
+    if (n > 0) (void)NMOEDecodeTokens(rt, tokens, n, stdout, YES, NO, 0, NULL);
+    return n;
+}
+
+static int NMOERunChat(nmoe_runtime *rt) {
+    static uint32_t tokens[4096];
+    const int capacity = 4096;
+    NMOEChatPrefillSystem(rt, tokens, capacity);
+    uint32_t pending = UINT32_MAX; // last generated token, not yet fed
     while (1) {
         fprintf(stdout, "\n> "); fflush(stdout);
         char line[4096];
         if (fgets(line, sizeof(line), stdin) == NULL) break;
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
+        if (len == 0) continue;
+        if (strcmp(line, "/reset") == 0) {
+            NMOEChatPrefillSystem(rt, tokens, capacity);
+            pending = UINT32_MAX;
+            fprintf(stdout, "[conversation cleared]\n");
+            continue;
+        }
         NSString *userPrompt = NMOEChatUserPrompt(NMOEStringFromC(line));
-        NMOEResetState(rt);
-        (void)NMOEProcessPromptAndDecode(rt, userPrompt, stdout, NO, rt->cfg.timing, rt->cfg.max_tokens, NULL);
+
+        int n = 0;
+        NSString *closing = @"";
+        if (pending == kNMOEEOS1) {
+            tokens[n++] = pending;               // <|im_end|>
+            closing = @"\n";
+        } else if (pending != UINT32_MAX) {
+            if (pending != kNMOEEOS2) tokens[n++] = pending; // truncated reply
+            closing = @"<|im_end|>\n";
+        }
+        NSString *turn = [closing stringByAppendingString:userPrompt];
+        int m = nmoe_tokenizer_encode(rt->tokenizer, turn.UTF8String, tokens + n, capacity - n);
+        if (m <= 0) continue;
+        n += m;
+
+        size_t needed = rt->sequencePosition + (size_t)n + (size_t)MAX(rt->cfg.max_tokens, 0) + 8u;
+        if (needed > rt->sequenceCapacity) {
+            fprintf(stdout, "[context full, starting a new conversation]\n");
+            NMOEChatPrefillSystem(rt, tokens, capacity);
+            n = nmoe_tokenizer_encode(rt->tokenizer, userPrompt.UTF8String, tokens, capacity);
+            if (n <= 0) { pending = UINT32_MAX; continue; }
+        }
+        pending = NMOEDecodeTokens(rt, tokens, n, stdout, NO, rt->cfg.timing, rt->cfg.max_tokens, NULL);
         fprintf(stdout, "\n"); fflush(stdout);
     }
     return 0;

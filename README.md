@@ -226,7 +226,7 @@ ln -s /path/to/qwen36_35b qwen36_35b
 ```bash
 ./nmoe ask "解释一下 KV cache 和 prefill/decode 的区别" --q4 --experts 8 --tokens 128
 ./nmoe ask "请用中文介绍本地大模型推理" --q2 --experts 8 --tokens 128 --timing
-./nmoe chat --q4 --experts 8 --tokens 512
+./nmoe chat --q4 --experts 8 --tokens 512      # multi-turn; type /reset to clear the conversation
 ./nmoe bench "请介绍一下量子计算" --q2 --experts 6 --tokens 128 --timing --quiet
 ./nmoe ppl scripts/eval/mixed.txt --q3          # teacher-forced perplexity / accuracy check
 ```
