@@ -1,19 +1,23 @@
-# nano-metal-moe-qwen36
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/hero-en-dark.svg">
+  <img alt="nano-metal-moe: Qwen3.6-35B-A3B on a 16 GB Mac mini. 9.0 tok/s decode, 35B params with 3B active, one Objective-C + Metal binary." src="docs/assets/hero-en-light.svg" width="100%">
+</picture>
 
-**English** | [简体中文](README.zh-CN.md)
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#how-it-works">How it works</a> ·
+  <a href="#performance">Performance</a> ·
+  <a href="README.zh-CN.md">简体中文</a>
+</p>
 
 Run **Qwen3.6-35B-A3B**, a 35-billion-parameter Mixture-of-Experts model, on a
-**base Mac mini with 16GB of RAM**, at about 9 tokens/second.
+**base Mac mini with 16GB of RAM**. `nmoe` is one native Objective-C + Metal
+binary: no Python, server, or ML framework at inference time.
 
-`nmoe` is a single native binary written in Objective-C and Metal. Python,
-servers, and ML frameworks are only used to prepare the model, never at
-inference time. Shared weights stay resident in memory. The 256 routed experts
-per layer stay on the SSD, and each token loads only the 8 experts the router
-picks.
-
-```
-$ ./nmoe ask "Explain the difference between prefill and decode in one paragraph."
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/architecture-en-dark.svg">
+  <img alt="Architecture: 1.4 GB of shared weights stay resident in memory; 13 GB of q3 expert packs stay on the SSD; per token and layer the GPU runs attention and the router, the CPU picks 8 of 256 experts and preads about 11 MB (85% from the page cache), and the GPU runs the 8 experts plus the shared expert." src="docs/assets/architecture-en-light.svg" width="100%">
+</picture>
 
 ## Highlights
 
@@ -22,7 +26,7 @@ $ ./nmoe ask "Explain the difference between prefill and decode in one paragraph
   demand. Only about 3B parameters are active per token.
 - **q3 expert pack, the recommended setup for 16GB.** A 3-bit requantization
   of the experts is 13GB instead of 18GB. More of it stays in the page cache,
-  so decode is **+35% faster** than q4 with no measurable accuracy loss.
+  so decode is **32% faster** than q4 with no measurable accuracy loss.
 - **Pipelined decode.** Each layer is one command buffer. The GPU signals a
   `MTLSharedEvent` when routing is ready, the CPU preads the chosen experts,
   and the GPU starts on the gate/up projections while the down weights are
@@ -38,6 +42,11 @@ $ ./nmoe ask "Explain the difference between prefill and decode in one paragraph
   eye.
 
 ## Performance
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/performance-en-dark.svg">
+  <img alt="q3 experts versus q4: decode 9.0 versus 6.8 tok/s (+32%), pack size 13 versus 18 GB, perplexity 5.59 versus 5.64." src="docs/assets/performance-en-light.svg" width="100%">
+</picture>
 
 Apple M4 Mac mini, 16GB, macOS 26, with a normal desktop workload running
 (browser, terminal):
@@ -142,7 +151,7 @@ If the package lives somewhere else, symlink it with
 | Pack | Size | Speed on 16GB | Accuracy |
 |---|---|---|---|
 | q4 | 18GB | baseline | reference |
-| **q3** | 13GB | +35% decode | same as q4 within noise (KL 0.029) |
+| **q3** | 13GB | +32% decode | same as q4 within noise (KL 0.029) |
 | q2 | 10GB | fastest | not evaluated here; 2-bit is expected to lose quality. Experimental (`convert_qwen36.py --bits 2`) |
 
 Reducing `--experts` is a worse trade than q3. For example, `--experts 6`
@@ -162,16 +171,13 @@ python3 scripts/ppl_compare.py /tmp/q4.bin /tmp/q3.bin   # top-1 agreement, KL, 
 ## How it works
 
 Each token passes through 40 layers. Thirty are GatedDeltaNet linear attention
-and every fourth is full attention with a KV cache. The per-layer decode
-pipeline is shown below; prefill runs the same steps for 32 tokens at a time.
+and every fourth is full attention with a KV cache. Prefill runs the same steps
+for 32 tokens at a time.
 
-```text
-GPU  norm → attention → router + shared expert ─┬─▶ [wait] gate/up ─▶ [wait] down + combine ─▶ next layer
-                                                 │         ▲                 ▲
-CPU                                    top-k (8 of 256)    │                 │
-                                         pread gate+up ────┘                 │
-                                         pread down (overlaps GPU gate/up) ──┘
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/pipeline-en-dark.svg">
+  <img alt="Per-layer pipeline: the GPU runs attention and the router, then waits on an event; the CPU runs top-k and preads gate/up weights, releasing the GPU for gate/up while it preads the down weights; only page-cache misses touch the SSD." src="docs/assets/pipeline-en-light.svg" width="100%">
+</picture>
 
 - **Shared weights** (`model_weights.bin`, q4) are mmap'd once and wrapped as
   a Metal buffer.

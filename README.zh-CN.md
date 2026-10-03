@@ -1,24 +1,29 @@
-# nano-metal-moe-qwen36
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/hero-zh-dark.svg">
+  <img alt="nano-metal-moe：在 16GB Mac mini 上运行 Qwen3.6-35B-A3B，生成速度 9.0 tok/s，35B 参数激活 3B，一个 Objective-C + Metal 原生程序。" src="docs/assets/hero-zh-light.svg" width="100%">
+</picture>
 
-[English](README.md) | **简体中文**
+<p align="center">
+  <a href="#快速开始">快速开始</a> ·
+  <a href="#工作原理">工作原理</a> ·
+  <a href="#性能">性能</a> ·
+  <a href="README.md">English</a>
+</p>
 
-在一台 **16GB 内存的基础款 Mac mini** 上运行 **Qwen3.6-35B-A3B**（350 亿参数的混合专家模型），
-生成速度约 **9 token/秒**。
+在一台 **16GB 内存的基础款 Mac mini** 上运行 **Qwen3.6-35B-A3B**（350 亿参数的混合专家模型）。
+`nmoe` 是一个 Objective-C + Metal 原生程序，推理时没有 Python、没有服务进程、没有机器学习框架。
 
-`nmoe` 是一个用 Objective-C + Metal 写成的原生程序。推理过程中没有 Python、没有服务进程、
-没有机器学习框架，Python 只在准备模型时用到。共享权重常驻内存；每层 256 个路由专家放在 SSD 上，
-每个 token 只加载路由器选中的 8 个。
-
-```
-$ ./nmoe ask "用一段话解释 prefill 和 decode 的区别。"
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/architecture-zh-dark.svg">
+  <img alt="架构：1.4GB 共享权重常驻内存；13GB 的 q3 专家包放在 SSD 上；每个 token 的每一层，GPU 计算注意力和路由，CPU 从 256 个专家中选 8 个并读取约 11MB（85% 命中页缓存），GPU 再计算这 8 个专家和共享专家。" src="docs/assets/architecture-zh-light.svg" width="100%">
+</picture>
 
 ## 亮点
 
 - **16GB 机器跑 35B 模型。** 共享权重约 1.4GB，常驻内存；路由专家（13–18GB）放在 SSD 上按需读取。
   每个 token 只激活约 3B 参数。
 - **q3 专家包，16GB 机器推荐。** 把专家重新量化到 3-bit，包从 18GB 降到 13GB，能留在页缓存里的更多，
-  decode 比 q4 **快 35%**，精度没有可测的下降。
+  decode 比 q4 **快 32%**，精度没有可测的下降。
 - **流水线 decode。** 每层只有一个 command buffer。路由结果一出来，GPU 就通过 `MTLSharedEvent`
   通知 CPU；CPU 读取选中的专家，down 权重还在读时，GPU 已经开始算 gate/up。
 - **批量 prompt prefill。** prompt 按 32 个 token 一组处理。专家读取与 GPU 计算重叠进行，
@@ -28,6 +33,11 @@ $ ./nmoe ask "用一段话解释 prefill 和 decode 的区别。"
   top-1 一致率。每项提速都用数字衡量精度，不靠肉眼判断。
 
 ## 性能
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/performance-zh-dark.svg">
+  <img alt="q3 与 q4 专家包对比：生成速度 9.0 对 6.8 tok/s（+32%），包大小 13 对 18GB，困惑度 5.59 对 5.64。" src="docs/assets/performance-zh-light.svg" width="100%">
+</picture>
 
 Apple M4 Mac mini，16GB，macOS 26，后台正常开着浏览器、终端等应用：
 
@@ -125,7 +135,7 @@ qwen36_35b/
 | 专家包 | 大小 | 16GB 机器上的速度 | 精度 |
 |---|---|---|---|
 | q4 | 18GB | 基准 | 参照 |
-| **q3** | 13GB | decode 快 35% | 与 q4 相当，差异在噪声范围内（KL 0.029） |
+| **q3** | 13GB | decode 快 32% | 与 q4 相当，差异在噪声范围内（KL 0.029） |
 | q2 | 10GB | 最快 | 本项目未评测，2-bit 预计精度损失较大；实验性质（`convert_qwen36.py --bits 2`） |
 
 减少 `--experts` 不如换 q3 划算。例如 `--experts 6` 会让困惑度上升约 9%（KL 0.039）。
@@ -143,15 +153,12 @@ python3 scripts/ppl_compare.py /tmp/q4.bin /tmp/q3.bin   # top-1 一致率、KL�
 ## 工作原理
 
 每个 token 经过 40 层：30 层是 GatedDeltaNet 线性注意力，每第 4 层是带 KV cache 的全注意力。
-下图是每层的 decode 流水线；prefill 走同样的步骤，只是一次处理 32 个 token。
+prefill 走同样的步骤，只是一次处理 32 个 token。
 
-```text
-GPU  norm → attention → router + shared expert ─┬─▶ [wait] gate/up ─▶ [wait] down + combine ─▶ 下一层
-                                                 │         ▲                 ▲
-CPU                                    top-k（256 选 8）    │                 │
-                                         pread gate+up ────┘                 │
-                                         pread down（与 GPU gate/up 重叠）───┘
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/pipeline-zh-dark.svg">
+  <img alt="每层流水线：GPU 计算注意力和路由后等待事件；CPU 做 top-k 并读取 gate/up 权重，放行 GPU 计算 gate/up，同时读取 down 权重；只有页缓存未命中才会访问 SSD。" src="docs/assets/pipeline-zh-light.svg" width="100%">
+</picture>
 
 - **共享权重**（`model_weights.bin`，q4）只 mmap 一次，并包装成 Metal buffer。
 - **路由专家**每层一个文件，用并行 `pread` 读进固定的 buffer，q3 下每个专家约 1.4MB。
