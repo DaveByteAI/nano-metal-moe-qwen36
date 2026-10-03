@@ -76,6 +76,8 @@ const char *nmoe_run_mode_name(nmoe_run_mode mode) {
             return "chat";
         case NMOE_RUN_BENCH:
             return "bench";
+        case NMOE_RUN_PPL:
+            return "ppl";
         default:
             return "ask";
     }
@@ -84,6 +86,7 @@ const char *nmoe_run_mode_name(nmoe_run_mode mode) {
 void nmoe_app_print_usage(const char *prog) {
     fprintf(stderr,
             "Usage: %s [ask|chat|bench] [prompt] [options]\n"
+            "       %s ppl TEXTFILE [--tokens N]   teacher-forced perplexity (NMOE_PPL_DUMP=path saves top logprobs)\n"
             "\n"
             "Options:\n"
             "  --model PATH        model package directory (default: qwen36_35b)\n"
@@ -91,14 +94,14 @@ void nmoe_app_print_usage(const char *prog) {
             "  --tokens N          generation limit (ask/bench default: 256, chat: 512)\n"
             "  --experts N         active experts per layer, 1..8 (default: 8)\n"
             "  --think N           force </think> after N thinking tokens; 0 disables (default: 1)\n"
-            "  --quant auto|2|4    expert quantization selection\n"
-            "  --q2 / --q4         shortcut for --quant 2|4\n"
+            "  --quant auto|2|3|4  expert quantization (auto prefers packed_experts_q3)\n"
+            "  --q2 / --q3 / --q4  shortcut for --quant 2|3|4\n"
             "  --timing            print timing summary\n"
             "  --quiet             suppress token streaming\n"
             "  --cpu-linear        force CPU linear-attention path\n"
             "  --trace-tokens      print generated token ids\n"
             "  -h, --help          show this help\n",
-            prog ? prog : "nmoe");
+            prog ? prog : "nmoe", prog ? prog : "nmoe");
 }
 
 static void nmoe_set_prompt(nmoe_app_config *cfg, const char *value) {
@@ -128,6 +131,10 @@ static int nmoe_parse_mode(const char *arg, nmoe_app_config *cfg) {
     }
     if (strcmp(arg, "bench") == 0) {
         cfg->mode = NMOE_RUN_BENCH;
+        return 1;
+    }
+    if (strcmp(arg, "ppl") == 0) {
+        cfg->mode = NMOE_RUN_PPL;
         return 1;
     }
     return 0;
@@ -182,6 +189,10 @@ int nmoe_app_parse(int argc, char **argv, nmoe_app_config *cfg) {
         }
         if (strcmp(arg, "--q2") == 0) {
             cfg->quant_bits = 2;
+            continue;
+        }
+        if (strcmp(arg, "--q3") == 0) {
+            cfg->quant_bits = 3;
             continue;
         }
         if (strcmp(arg, "--q4") == 0) {
@@ -244,6 +255,8 @@ int nmoe_app_parse(int argc, char **argv, nmoe_app_config *cfg) {
                 cfg->quant_bits = 0;
             } else if (strcmp(value, "2") == 0) {
                 cfg->quant_bits = 2;
+            } else if (strcmp(value, "3") == 0) {
+                cfg->quant_bits = 3;
             } else if (strcmp(value, "4") == 0) {
                 cfg->quant_bits = 4;
             } else {
@@ -260,7 +273,7 @@ int nmoe_app_parse(int argc, char **argv, nmoe_app_config *cfg) {
         return -1;
     }
 
-    if (cfg->mode == NMOE_RUN_ASK || cfg->mode == NMOE_RUN_BENCH) {
+    if (cfg->mode == NMOE_RUN_ASK || cfg->mode == NMOE_RUN_BENCH || cfg->mode == NMOE_RUN_PPL) {
         if (!cfg->prompt) {
             return -1;
         }

@@ -126,7 +126,7 @@ static size_t g_deferredExpertGpuCount = 0;
 static id<MTLSharedEvent> g_expertRouteEvent = nil;
 static id<MTLSharedEvent> g_expertDataEvent = nil;
 static uint64_t g_expertEventValue = 0; // g_expertRouteEvent values
-static uint64_t g_expertDataValue = 0;  // g_expertDataEvent values (2 per layer: gate+up wave, down wave)
+static uint64_t g_expertDataValue = 0;  // g_expertDataEvent values (per layer: K per-slot gate+up values + 1 down wave; legacy two-wave mode uses 2)
 static void *g_expertParamsBuf = nil; // 16 floats: [0..7]=expert weights, [8]=shared gate raw score
 
 static void NMOEFinalizeDeferredExperts(nmoe_runtime *rt) {
@@ -261,6 +261,7 @@ struct nmoe_runtime {
     BOOL quiet;
     BOOL cpuLinear;
     BOOL traceTokens;
+    BOOL fullLogits; /* ppl mode: always materialize full lm_head logits */
     BOOL inThink;
     size_t thinkCount;
     NMOELayerWeights layers[kNMOELayers];
@@ -1056,7 +1057,9 @@ static BOOL NMOEEncodeExpertGateUpQ4Batched(id<MTLCommandBuffer> cmd,
     if (cmd == nil || rt == NULL || expertBuffers == NULL || count == 0 ||
         inputMTL == nil || actMTL == nil || offsets == NULL || expertBuffers[0] == nil) return NO;
 
-    id<MTLComputePipelineState> pipeline = (__bridge id<MTLComputePipelineState>)nmoe_backend_pipeline_state(rt->backend, NMOE_BACKEND_KERNEL_EXPERT_GATE_UP_Q4_BATCHED);
+    BOOL q3 = rt->quantBits == 3;
+    id<MTLComputePipelineState> pipeline = (__bridge id<MTLComputePipelineState>)nmoe_backend_pipeline_state(rt->backend,
+        q3 ? NMOE_BACKEND_KERNEL_EXPERT_GATE_UP_Q3_BATCHED : NMOE_BACKEND_KERNEL_EXPERT_GATE_UP_Q4_BATCHED);
     if (pipeline == nil) return NO;
 
     uint32_t rowsPerTG = NMOEExpertRowsPerThreadgroup(pipeline);
@@ -1064,7 +1067,7 @@ static BOOL NMOEEncodeExpertGateUpQ4Batched(id<MTLCommandBuffer> cmd,
         .expert_count = (uint32_t)MIN(count, kNMOEMaxExperts),
         .out_rows = 512u,
         .in_dim = (uint32_t)kNMOEHiddenDim,
-        .packed_cols = (uint32_t)(kNMOEHiddenDim / 8u),
+        .packed_cols = (uint32_t)(kNMOEHiddenDim / (q3 ? 16u : 8u)), // q3: 16-value units
         .group_size = 64u,
         .gate_weight = (uint32_t)offsets->gate_weight,
         .gate_scales = (uint32_t)offsets->gate_scales,
@@ -1085,6 +1088,56 @@ static BOOL NMOEEncodeExpertGateUpQ4Batched(id<MTLCommandBuffer> cmd,
         NMOESetExpertBaseBuffers(encoder, expertBuffers);
         [encoder setBuffer:inputMTL offset:0 atIndex:8];
         [encoder setBuffer:actMTL offset:0 atIndex:9];
+        [encoder setBytes:&args length:sizeof(args) atIndex:10];
+    });
+}
+
+// Encode gate_up for a single expert slot: same kernel as the batched variant
+// with expert_count=1, writing its 512 activations at slot*act_stride via a
+// buffer offset. Used by the incremental pipeline to place a per-slot event
+// wait in front of each expert's compute.
+static BOOL NMOEEncodeExpertGateUpQ4Slot(id<MTLCommandBuffer> cmd,
+                                          nmoe_runtime *rt,
+                                          id<MTLBuffer> expertBuffer,
+                                          size_t slot,
+                                          id<MTLBuffer> inputMTL,
+                                          id<MTLBuffer> actMTL,
+                                          const NMOEExpertOffsets *offsets) {
+    if (cmd == nil || rt == NULL || expertBuffer == nil || slot >= kNMOEMaxExperts ||
+        inputMTL == nil || actMTL == nil || offsets == NULL) return NO;
+
+    id<MTLComputePipelineState> pipeline = (__bridge id<MTLComputePipelineState>)nmoe_backend_pipeline_state(rt->backend, NMOE_BACKEND_KERNEL_EXPERT_GATE_UP_Q4_BATCHED);
+    if (pipeline == nil) return NO;
+
+    uint32_t rowsPerTG = NMOEExpertRowsPerThreadgroup(pipeline);
+    NMOEExpertBatchedArgs args = {
+        .expert_count = 1u,
+        .out_rows = 512u,
+        .in_dim = (uint32_t)kNMOEHiddenDim,
+        .packed_cols = (uint32_t)(kNMOEHiddenDim / 8u),
+        .group_size = 64u,
+        .gate_weight = (uint32_t)offsets->gate_weight,
+        .gate_scales = (uint32_t)offsets->gate_scales,
+        .gate_biases = (uint32_t)offsets->gate_biases,
+        .up_weight = (uint32_t)offsets->up_weight,
+        .up_scales = (uint32_t)offsets->up_scales,
+        .up_biases = (uint32_t)offsets->up_biases,
+        .down_weight = (uint32_t)offsets->down_weight,
+        .down_scales = (uint32_t)offsets->down_scales,
+        .down_biases = (uint32_t)offsets->down_biases,
+        .act_stride = 512u,
+        .expert_size = 0u,
+        .rows_per_tg = rowsPerTG,
+    };
+
+    NSUInteger rowGroups = (NSUInteger)((args.out_rows + rowsPerTG - 1u) / rowsPerTG);
+    NSUInteger actOffset = (NSUInteger)(slot * 512u * sizeof(float));
+    return NMOEEncodeKernelTG(cmd, pipeline, rowGroups, (NSUInteger)rowsPerTG * 32u, ^(id<MTLComputeCommandEncoder> encoder) {
+        for (int i = 0; i < 8; ++i) {
+            [encoder setBuffer:expertBuffer offset:0 atIndex:(NSUInteger)i];
+        }
+        [encoder setBuffer:inputMTL offset:0 atIndex:8];
+        [encoder setBuffer:actMTL offset:actOffset atIndex:9];
         [encoder setBytes:&args length:sizeof(args) atIndex:10];
     });
 }
@@ -1154,7 +1207,9 @@ static BOOL NMOEEncodeExpertDownCombineQ4Tensor(id<MTLCommandBuffer> cmd,
         hiddenOutBuffer == NULL || sharedDown == NULL || offsets == NULL ||
         expertBuffers[0] == nil) return NO;
 
-    id<MTLComputePipelineState> pipeline = (__bridge id<MTLComputePipelineState>)nmoe_backend_pipeline_state(rt->backend, NMOE_BACKEND_KERNEL_EXPERT_DOWN_COMBINE_Q4);
+    BOOL q3 = rt->quantBits == 3;
+    id<MTLComputePipelineState> pipeline = (__bridge id<MTLComputePipelineState>)nmoe_backend_pipeline_state(rt->backend,
+        q3 ? NMOE_BACKEND_KERNEL_EXPERT_DOWN_COMBINE_Q3 : NMOE_BACKEND_KERNEL_EXPERT_DOWN_COMBINE_Q4);
     id<MTLBuffer> weightBuffer = (__bridge id<MTLBuffer>)nmoe_backend_weight_buffer(rt->backend);
     id<MTLBuffer> hMidMTL = NMOEBridgeBuffer(hMidBuffer);
     id<MTLBuffer> sharedMTL = NMOEBridgeBuffer(sharedOutBuffer);
@@ -1182,7 +1237,7 @@ static BOOL NMOEEncodeExpertDownCombineQ4Tensor(id<MTLCommandBuffer> cmd,
         .expert_count = (uint32_t)MIN(count, kNMOEMaxExperts),
         .out_rows = (uint32_t)kNMOEHiddenDim,
         .in_dim = 512u,
-        .packed_cols = 64u,
+        .packed_cols = q3 ? 32u : 64u, // q3: 16-value units
         .group_size = 64u,
         .gate_weight = (uint32_t)offsets->gate_weight,
         .gate_scales = (uint32_t)offsets->gate_scales,
@@ -1448,6 +1503,19 @@ static BOOL NMOEUseFusedDownCombineQ4(void) {
            value[0] == 'y' || value[0] == 'Y';
 }
 
+// Incremental gate_up release: the GPU waits per expert slot and starts each
+// expert's gate_up as soon as that expert's pread lands, instead of stalling
+// until the whole wave-1 read completes. q4 pipelined mode only. Default off:
+// measured neutral (±2%), because GPU expert compute (~0.2-0.3ms/layer) is far
+// smaller than the CPU pread wall, so releasing the GPU early does not shorten
+// the critical path (see 优化.md 2026-07-05).
+static BOOL NMOEUseIncrementalGateUp(void) {
+    const char *value = getenv("NMOE_INCREMENTAL_GATEUP");
+    if (value == NULL || value[0] == '\0') return NO;
+    return value[0] == '1' || value[0] == 't' || value[0] == 'T' ||
+           value[0] == 'y' || value[0] == 'Y';
+}
+
 static BOOL NMOECopyExpertsToMetalBuffers(void) {
     const char *value = getenv("NMOE_COPY_EXPERTS");
     if (value == NULL || value[0] == '\0') return NO;
@@ -1495,6 +1563,94 @@ static uint32_t NMOEMatvecRowsPerThreadgroup(id<MTLComputePipelineState> pipelin
     return rows;
 }
 
+// Routing-weight pruning (experiment): after top-k + renormalize, drop tail
+// experts whose combined weight is negligible so their pread is skipped.
+//   NMOE_ROUTE_MIN_WEIGHT=w  drop experts with renormalized weight < w
+//   NMOE_ROUTE_TOP_P=p       keep the smallest prefix whose weight sum >= p
+//   NMOE_ROUTE_MIN_KEEP=n    never keep fewer than n experts (default 2)
+// Kept weights are renormalized to sum to 1. Selection is sorted descending,
+// so pruning only ever removes a suffix.
+static float NMOEEnvFloat(const char *name, float fallback) {
+    const char *value = getenv(name);
+    if (value == NULL || value[0] == '\0') return fallback;
+    return strtof(value, NULL);
+}
+
+static size_t g_routeSelectedTotal = 0;
+static size_t g_routeKeptTotal = 0;
+static FILE *g_routeTraceFile = NULL;
+
+static size_t NMOEPruneRoute(size_t count, float *weights) {
+    static int loaded = 0;
+    static float minWeight = 0.0f, topP = 0.0f;
+    static size_t minKeep = 2;
+    if (!loaded) {
+        minWeight = NMOEEnvFloat("NMOE_ROUTE_MIN_WEIGHT", 0.0f);
+        topP = NMOEEnvFloat("NMOE_ROUTE_TOP_P", 0.0f);
+        minKeep = (size_t)MAX(1.0f, NMOEEnvFloat("NMOE_ROUTE_MIN_KEEP", 2.0f));
+        loaded = 1;
+    }
+    size_t keep = count;
+    if (minWeight > 0.0f) {
+        while (keep > minKeep && weights[keep - 1] < minWeight) keep--;
+    }
+    if (topP > 0.0f && topP < 1.0f) {
+        float cum = 0.0f;
+        size_t n = 0;
+        while (n < keep) { cum += weights[n++]; if (cum >= topP) break; }
+        keep = MAX(n, MIN(minKeep, keep));
+    }
+    if (keep < count) {
+        float sum = 0.0f;
+        for (size_t i = 0; i < keep; ++i) sum += weights[i];
+        if (sum > 0.0f) for (size_t i = 0; i < keep; ++i) weights[i] /= sum;
+        for (size_t i = keep; i < count; ++i) weights[i] = 0.0f;
+    }
+    g_routeSelectedTotal += count;
+    g_routeKeptTotal += keep;
+    return keep;
+}
+
+// NMOE_ROUTE_TRACE=path appends one text line per (token, layer):
+// "layer idx:weight idx:weight ..." with weights before pruning.
+static void NMOETraceRoute(int layerIndex, const size_t *indices, const float *weights, size_t count) {
+    static int opened = 0;
+    if (!opened) {
+        opened = 1;
+        const char *path = getenv("NMOE_ROUTE_TRACE");
+        if (path != NULL && path[0] != '\0') g_routeTraceFile = fopen(path, "w");
+    }
+    if (g_routeTraceFile == NULL) return;
+    fprintf(g_routeTraceFile, "%d", layerIndex);
+    for (size_t i = 0; i < count; ++i) fprintf(g_routeTraceFile, " %zu:%.5f", indices[i], weights[i]);
+    fputc('\n', g_routeTraceFile);
+}
+
+// NMOE_RESIDENCY_STATS=1: before each expert read, mincore() the selected
+// experts' pages to measure the page-cache hit rate seen by expert fetch.
+static size_t g_residencyPagesTotal = 0;
+static size_t g_residencyPagesResident = 0;
+
+static size_t g_expertIOSize;
+static void NMOESampleExpertResidency(const NMOEExpertLayerFile *file, const size_t *indices, size_t count) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *value = getenv("NMOE_RESIDENCY_STATS");
+        enabled = (value != NULL && value[0] == '1') ? 1 : 0;
+    }
+    if (!enabled || file == NULL || file->base == NULL) return;
+    size_t page = (size_t)getpagesize();
+    size_t esz = g_expertIOSize;
+    char vec[256];
+    for (size_t i = 0; i < count; ++i) {
+        size_t pages = (esz + page - 1) / page;
+        if (pages > sizeof(vec)) continue;
+        if (mincore((uint8_t *)file->base + indices[i] * esz, esz, vec) != 0) continue;
+        for (size_t p = 0; p < pages; ++p) g_residencyPagesResident += (vec[p] & 1);
+        g_residencyPagesTotal += pages;
+    }
+}
+
 static size_t NMOESelectRouteTopKCPU(nmoe_runtime *rt,
                                      size_t k,
                                      size_t *selectedIndices,
@@ -1537,7 +1693,7 @@ static void *g_expertIOSharedActBuf = nil;
 static void *g_expertIOSharedDownBuf = nil;
 static void *g_expertIOExpertActBuf = nil;
 static int g_expertIOBits = 0;
-static size_t g_expertIOSize = 0;
+static size_t g_expertIOSize;
 
 static BOOL NMOEInitExpertIOBuffers(nmoe_runtime *rt) {
     if (g_expertIOBuffers[0] != NULL && g_expertIOBits == rt->quantBits) return YES;
@@ -1637,6 +1793,53 @@ static BOOL NMOEAsyncReadExperts(int fd, const uint8_t *mmapBase,
                                   const size_t *indices, size_t count,
                                   void **buffers, int *outValid) {
     return NMOEAsyncReadExpertsRange(fd, mmapBase, indices, count, buffers, outValid, 0, 0);
+}
+
+// Read the gate+up range [0, rangeLen) of each selected expert in parallel and
+// release the GPU one slot at a time: event value baseValue+i is signaled as
+// soon as slot i's pread lands, so the GPU starts that expert's gate_up while
+// the remaining reads are still in flight. SharedEvent values must rise
+// monotonically, so completions are consumed in slot order; an out-of-order
+// finish just waits its turn. Returns after all slots are read and signaled.
+static void NMOEReadExpertsGateUpIncremental(int fd, const size_t *indices, size_t count,
+                                             void **buffers, int *outValid, size_t rangeLen,
+                                             id<MTLSharedEvent> evData, uint64_t baseValue) {
+    size_t esz = g_expertIOSize;
+    dispatch_queue_t ioQueue = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+    dispatch_semaphore_t sems[kNMOEMaxExperts];
+    for (size_t k = 0; k < count; k++) {
+        sems[k] = dispatch_semaphore_create(0);
+        outValid[k] = 1;
+        size_t offset = indices[k] * esz;
+        id<MTLBuffer> buf = (__bridge id<MTLBuffer>)buffers[k];
+        if (buf == nil || buf.length < esz) {
+            outValid[k] = 0;
+            dispatch_semaphore_signal(sems[k]);
+            continue;
+        }
+        dispatch_semaphore_t sem = sems[k];
+        int *validSlot = &outValid[k];
+        dispatch_async(ioQueue, ^{
+            uint8_t *dst = (uint8_t *)buf.contents;
+            size_t remaining = rangeLen;
+            off_t pos = (off_t)offset;
+            while (remaining > 0) {
+                ssize_t rc = pread(fd, dst, remaining, pos);
+                if (rc <= 0) {
+                    *validSlot = 0;
+                    break;
+                }
+                dst += rc;
+                pos += rc;
+                remaining -= (size_t)rc;
+            }
+            dispatch_semaphore_signal(sem);
+        });
+    }
+    for (size_t k = 0; k < count; k++) {
+        dispatch_semaphore_wait(sems[k], DISPATCH_TIME_FOREVER);
+        evData.signaledValue = baseValue + k;
+    }
 }
 
 static BOOL NMOEWrapMappedExperts(nmoe_runtime *rt,
@@ -2248,7 +2451,13 @@ static const NMOEExpertOffsets *NMOEExpertOffsetsForBits(int bits) {
         327680, 589824, 622592,
         655360, 917504, 950272,
     };
-    return bits == 2 ? &q2 : &q4;
+    // Planar q3 (scripts/requant_experts.py --container q3): 3 words per 32 values.
+    static const NMOEExpertOffsets q3 = {
+        0, 393216, 425984,
+        458752, 851968, 884736,
+        917504, 1310720, 1343488,
+    };
+    return bits == 2 ? &q2 : (bits == 3 ? &q3 : &q4);
 }
 
 
@@ -2627,18 +2836,24 @@ static BOOL NMOERuntimeInitialise(nmoe_runtime *rt, NSError **error) {
     int q2Exists = 0;
     NSString *q4Layer = NMOEJoinPath(NMOEJoinPath(modelDir, @"packed_experts"), @"layer_00.bin");
     NSString *q2Layer = NMOEJoinPath(NMOEJoinPath(modelDir, @"packed_experts_2bit"), @"layer_00.bin");
+    NSString *q3Layer = NMOEJoinPath(NMOEJoinPath(modelDir, @"packed_experts_q3"), @"layer_00.bin");
     q4Exists = access(q4Layer.fileSystemRepresentation, R_OK) == 0;
     q2Exists = access(q2Layer.fileSystemRepresentation, R_OK) == 0;
+    int q3Exists = access(q3Layer.fileSystemRepresentation, R_OK) == 0;
 
     rt->quantBits = rt->cfg.quant_bits;
     if (rt->quantBits == 0) {
-        rt->quantBits = (q2Exists && !q4Exists) ? 2 : 4;
+        // auto: prefer q3 when present (smaller pack -> far higher page-cache
+        // hit rate on 16GB machines), then q4, then q2.
+        rt->quantBits = q3Exists ? 3 : ((q2Exists && !q4Exists) ? 2 : 4);
     }
-    if (rt->quantBits != 2 && rt->quantBits != 4) {
+    if (rt->quantBits != 2 && rt->quantBits != 3 && rt->quantBits != 4) {
         rt->quantBits = 4;
     }
 
-    NSString *expertDir = rt->quantBits == 2 ? NMOEJoinPath(modelDir, @"packed_experts_2bit") : NMOEJoinPath(modelDir, @"packed_experts");
+    NSString *expertDir = rt->quantBits == 2 ? NMOEJoinPath(modelDir, @"packed_experts_2bit")
+                        : (rt->quantBits == 3 ? NMOEJoinPath(modelDir, @"packed_experts_q3")
+                                              : NMOEJoinPath(modelDir, @"packed_experts"));
     if (!NMOEPathExists(expertDir, NULL)) {
         if (error != NULL) {
             *error = NMOEMakeError(63, [NSString stringWithFormat:@"missing expert directory %@", expertDir]);
@@ -2775,6 +2990,9 @@ static void NMOELinearAttentionStep(nmoe_runtime *rt,
 // is NULL (all K slots are encoded; invalid slots are neutralized by a zero
 // combine weight). In legacy synchronous mode `expertWeights`/`valid` carry
 // the routing results known at encode time.
+// When `gateWaitEvent` is non-nil (incremental pipelined mode), slot i's
+// gate_up dispatch is encoded behind a wait on value gateWaitBase+i so the
+// GPU starts each expert as soon as its pread lands.
 static BOOL NMOEEncodeExpertPhase(id<MTLCommandBuffer> cmd,
                                   nmoe_runtime *rt,
                                   const NMOELayerWeights *layer,
@@ -2786,14 +3004,17 @@ static BOOL NMOEEncodeExpertPhase(id<MTLCommandBuffer> cmd,
                                   void *outputBuf,
                                   int layerIndex,
                                   const NMOEExpertOffsets *offsets,
+                                  id<MTLSharedEvent> gateWaitEvent,
+                                  uint64_t gateWaitBase,
                                   id<MTLSharedEvent> downWaitEvent,
                                   uint64_t downWaitValue,
                                   BOOL *outNextInputNormReady) {
     if (cmd == nil || rt == NULL || layer == NULL || expertBuffers == NULL ||
         selectedCount == 0 || outputBuf == NULL || offsets == NULL) return NO;
 
-    BOOL useFusedDownCombineQ4 = (rt->quantBits == 4 && g_expertIOExpertActBuf != NULL &&
-                                  NMOEUseFusedDownCombineQ4());
+    // q3 experts only have the fused down+combine kernel.
+    BOOL useFusedDownCombineQ4 = (g_expertIOExpertActBuf != NULL &&
+                                  ((rt->quantBits == 4 && NMOEUseFusedDownCombineQ4()) || rt->quantBits == 3));
     if (!useFusedDownCombineQ4) {
         if (!NMOEEncodeDequantMatVecTensor(cmd, rt, &layer->sharedDownProj,
                                            g_expertIOSharedActBuf, 0, g_expertIOSharedDownBuf, 0,
@@ -2815,11 +3036,24 @@ static BOOL NMOEEncodeExpertPhase(id<MTLCommandBuffer> cmd,
 
     BOOL usedBatchedQ4 = NO;
     BOOL usedFusedDownCombineQ4 = NO;
-    if (rt->quantBits == 4 && g_expertIOExpertActBuf != NULL &&
-        gateUpQ4BatchedPipe != nil && downQ4BatchedPipe != nil) {
+    BOOL canBatchQ4 = ((rt->quantBits == 4 || rt->quantBits == 3) && g_expertIOExpertActBuf != NULL &&
+                       gateUpQ4BatchedPipe != nil && downQ4BatchedPipe != nil);
+    if (gateWaitEvent != nil && !canBatchQ4) {
+        // Fallback paths have no per-slot waits: hold everything behind the
+        // last gate value, which the CPU signals once all gate+up data landed.
+        [cmd encodeWaitForEvent:gateWaitEvent value:gateWaitBase + selectedCount - 1];
+    }
+    if (canBatchQ4) {
         id<MTLBuffer> expertActBatchMTL = (__bridge id<MTLBuffer>)g_expertIOExpertActBuf;
-        if (!NMOEEncodeExpertGateUpQ4Batched(cmd, rt, expertBuffers, selectedCount,
-                                              expertInputMTL, expertActBatchMTL, offsets)) return NO;
+        if (gateWaitEvent != nil) {
+            for (size_t slot = 0; slot < selectedCount; ++slot) {
+                [cmd encodeWaitForEvent:gateWaitEvent value:gateWaitBase + slot];
+                if (!NMOEEncodeExpertGateUpQ4Slot(cmd, rt, expertBuffers[slot], slot,
+                                                   expertInputMTL, expertActBatchMTL,
+                                                   offsets)) return NO;
+            }
+        } else if (!NMOEEncodeExpertGateUpQ4Batched(cmd, rt, expertBuffers, selectedCount,
+                                                     expertInputMTL, expertActBatchMTL, offsets)) return NO;
         if (downWaitEvent != nil) {
             [cmd encodeWaitForEvent:downWaitEvent value:downWaitValue];
         }
@@ -2926,14 +3160,27 @@ static BOOL NMOEPipelinedExpertTail(nmoe_runtime *rt,
     if (expertBuffers[0] == nil) return NO;
 
     NMOEExpertOffsets offsets = *NMOEExpertOffsetsForBits(rt->quantBits);
+    BOOL incremental = NMOEUseIncrementalGateUp() && rt->quantBits == 4 &&
+                       g_expertIOExpertActBuf != NULL;
     uint64_t ev = ++g_expertEventValue;
-    uint64_t dataWave1 = ++g_expertDataValue;
+    // Incremental mode allocates one evData value per expert slot (gateBase+i,
+    // signaled as slot i's gate+up pread lands) plus one for the down wave.
+    // Legacy two-wave mode allocates dataWave1 + dataWave2.
+    uint64_t gateBase = 0;
+    uint64_t dataWave1 = 0;
+    if (incremental) {
+        gateBase = g_expertDataValue + 1;
+        g_expertDataValue += K;
+    } else {
+        dataWave1 = ++g_expertDataValue;
+    }
     uint64_t dataWave2 = ++g_expertDataValue;
     [cmd encodeSignalEvent:evRoute value:ev];
-    [cmd encodeWaitForEvent:evData value:dataWave1];
+    if (!incremental) [cmd encodeWaitForEvent:evData value:dataWave1];
     BOOL nextInputNormReady = NO;
     if (!NMOEEncodeExpertPhase(cmd, rt, layer, expertBuffers, K, NULL, NULL, 0.0f,
                                outputBuf, layerIndex, &offsets,
+                               incremental ? evData : nil, gateBase,
                                evData, dataWave2, &nextInputNormReady)) {
         return NO; // nothing committed yet — safe to bail
     }
@@ -2959,18 +3206,32 @@ static BOOL NMOEPipelinedExpertTail(nmoe_runtime *rt,
         evData.signaledValue = dataWave2; // unblock both waits before bailing
         return NO;
     }
+    NMOETraceRoute(layerIndex, selectedIndices, selectedValues, selectedCount);
+    selectedCount = NMOEPruneRoute(selectedCount, selectedValues);
+    NMOESampleExpertResidency(expertFile, selectedIndices, selectedCount);
     if (stats != NULL) stats->route += NMOENowSeconds() - t1;
     float sharedGateScore = NMOEFloatBuffer(rt->sharedOutBuffer)[0];
 
     // Fill input buffer before wave 1 (gate_up kernel reads it)
     memcpy(((__bridge id<MTLBuffer>)g_expertIOInputBuf).contents, NMOEFloatBuffer(rt->normBuffer), kNMOEHiddenDim * sizeof(float));
 
-    // Wave 1: load gate+up weights [0, down_weight), then release GPU gate_up kernels
+    // Wave 1: load gate+up weights [0, down_weight), then release GPU gate_up kernels.
+    // Incremental mode signals gateBase+i per slot as its pread lands, so the GPU
+    // starts each expert's gate_up while the remaining reads are still in flight.
     t1 = NMOENowSeconds();
     int valid[8] = {0};
-    NMOEAsyncReadExpertsRange(expertFile->fd, NULL, selectedIndices, selectedCount,
-                              g_expertIOBuffers, valid, 0, offsets.down_weight);
-    evData.signaledValue = dataWave1; // GPU starts gate_up kernels
+    if (incremental) {
+        NMOEReadExpertsGateUpIncremental(expertFile->fd, selectedIndices, selectedCount,
+                                         g_expertIOBuffers, valid, offsets.down_weight,
+                                         evData, gateBase);
+        if (selectedCount < K) {
+            evData.signaledValue = gateBase + K - 1; // release slots routing never filled
+        }
+    } else {
+        NMOEAsyncReadExpertsRange(expertFile->fd, NULL, selectedIndices, selectedCount,
+                                  g_expertIOBuffers, valid, 0, offsets.down_weight);
+        evData.signaledValue = dataWave1; // GPU starts gate_up kernels
+    }
 
     // Wave 2: while GPU runs gate_up, fill combine params + load down weights
     memcpy(((__bridge id<MTLBuffer>)g_expertIOHMidBuf).contents, NMOEFloatBuffer(outputBuf), kNMOEHiddenDim * sizeof(float));
@@ -2998,42 +3259,26 @@ static BOOL NMOEPipelinedExpertTail(nmoe_runtime *rt,
     return YES;
 }
 
-static BOOL NMOEFullAttentionStepMetal(nmoe_runtime *rt,
-                                       int layerIndex,
-                                       const float *residual,
-                                       float *layerOutput,
-                                       size_t position,
-                                       NMOEPerfStats *stats) {
-    if (rt == NULL || rt->backend == NULL || residual == NULL || layerOutput == NULL) return NO;
-
+// Encode one full-attention layer's context for the token at `position`:
+// input norm (optional) -> q/k/v -> qk prep + RoPE -> KV cache write ->
+// attention -> o_proj -> residual -> post norm -> router scores + shared
+// expert gate/up/score. Leaves h_mid in outputBuf, the post-norm hidden in
+// rt->normBuffer, router logits in rt->routerScoresBuffer, shared act in
+// g_expertIOSharedActBuf and the shared gate score in rt->sharedOutBuffer[0].
+static BOOL NMOEEncodeFullContext(id<MTLCommandBuffer> cmd,
+                                  nmoe_runtime *rt,
+                                  int layerIndex,
+                                  void *residualBuf,
+                                  void *outputBuf,
+                                  size_t position,
+                                  BOOL doInputNorm) {
     NMOELayerState *state = &rt->layerState[layerIndex];
     const NMOELayerWeights *layer = &rt->layers[layerIndex];
     NSString *lp = [NSString stringWithFormat:@"model.layers.%d", layerIndex];
-    void *residualBuf = NMOEHiddenBufferForPointer(rt, residual);
-    void *outputBuf = NMOEHiddenBufferForPointer(rt, layerOutput);
-    if (residualBuf == NULL || outputBuf == NULL) return NO;
-
-    id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)nmoe_backend_command_queue(rt->backend);
-    if (!NMOEInitExpertIOBuffers(rt)) return NO;
-    BOOL cpuRouter = NMOEUseCPURouter();
-    NMOEExpertLayerFile *expertFile = &state->expertFile;
-    BOOL gpuRoutedExperts = (NMOEUseRoutedExperts() && rt->quantBits == 4 && !cpuRouter &&
-                             expertFile->metalBuffer != NULL && g_expertIOExpertActBuf != NULL);
-
     size_t seqLen = position + 1u;
     float invScale = 1.0f / sqrtf((float)kNMOEHeadDim);
-
-    // ================================================================
-    // Single unified command buffer: ALL sync GPU ops
-    // ================================================================
-    double t0 = NMOENowSeconds();
-    {
-        id<MTLCommandBuffer> cmd = [queue commandBuffer];
-        if (cmd == nil) return NO;
-
         // --- input RMS norm ---
-        BOOL deferredInputNorm = NMOEDeferredInputNormReadyForLayer(layerIndex);
-        if (!deferredInputNorm &&
+        if (doInputNorm &&
             !NMOEEncodeRMSNormTensor(cmd, rt, &layer->inputNorm,
                                      residualBuf, 0, rt->normBuffer, 0,
                                      kNMOEHiddenDim, YES, 1e-6f)) return NO;
@@ -3148,7 +3393,7 @@ static BOOL NMOEFullAttentionStepMetal(nmoe_runtime *rt,
         if (!NMOEEncodeRMSNormTensor(cmd, rt, &layer->postNorm,
                                      outputBuf, 0, rt->normBuffer, 0,
                                      kNMOEHiddenDim, YES, 1e-6f)) return NO;
-        if (rt->quantBits == 4) {
+        if (rt->quantBits == 4 || rt->quantBits == 3) {
             if (!NMOEEncodeRouteSharedQ4Tensors(cmd, rt,
                                                 &layer->routerGate, &layer->sharedGateProj,
                                                 &layer->sharedUpProj, &layer->sharedGateScore,
@@ -3164,6 +3409,41 @@ static BOOL NMOEFullAttentionStepMetal(nmoe_runtime *rt,
             if (!NMOEEncodeDequantMatVec(cmd, rt, [lp stringByAppendingString:@".mlp.shared_expert_gate"],
                                           rt->normBuffer, 0, rt->sharedOutBuffer, 0, 1u, kNMOEHiddenDim)) return NO;
         }
+    return YES;
+}
+
+static BOOL NMOEFullAttentionStepMetal(nmoe_runtime *rt,
+                                       int layerIndex,
+                                       const float *residual,
+                                       float *layerOutput,
+                                       size_t position,
+                                       NMOEPerfStats *stats) {
+    if (rt == NULL || rt->backend == NULL || residual == NULL || layerOutput == NULL) return NO;
+
+    NMOELayerState *state = &rt->layerState[layerIndex];
+    const NMOELayerWeights *layer = &rt->layers[layerIndex];
+    void *residualBuf = NMOEHiddenBufferForPointer(rt, residual);
+    void *outputBuf = NMOEHiddenBufferForPointer(rt, layerOutput);
+    if (residualBuf == NULL || outputBuf == NULL) return NO;
+
+    id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)nmoe_backend_command_queue(rt->backend);
+    if (!NMOEInitExpertIOBuffers(rt)) return NO;
+    BOOL cpuRouter = NMOEUseCPURouter();
+    NMOEExpertLayerFile *expertFile = &state->expertFile;
+    BOOL gpuRoutedExperts = (NMOEUseRoutedExperts() && rt->quantBits == 4 && !cpuRouter &&
+                             expertFile->metalBuffer != NULL && g_expertIOExpertActBuf != NULL);
+
+
+    // ================================================================
+    // Single unified command buffer: ALL sync GPU ops
+    // ================================================================
+    double t0 = NMOENowSeconds();
+    {
+        id<MTLCommandBuffer> cmd = [queue commandBuffer];
+        if (cmd == nil) return NO;
+
+        if (!NMOEEncodeFullContext(cmd, rt, layerIndex, residualBuf, outputBuf, position,
+                                   !NMOEDeferredInputNormReadyForLayer(layerIndex))) return NO;
         if (!cpuRouter && !NMOEEncodeRouteTopK(cmd, rt, (size_t)rt->cfg.experts)) return NO;
         if (gpuRoutedExperts) {
             if (!NMOEEncodeDequantMatVecTensor(cmd, rt, &layer->sharedDownProj,
@@ -3246,7 +3526,7 @@ static BOOL NMOEFullAttentionStepMetal(nmoe_runtime *rt,
         BOOL nextInputNormReady = NO;
         if (!NMOEEncodeExpertPhase(cmd, rt, layer, expertBuffers, selectedCount, valid,
                                    selectedValues, sharedGateScore, outputBuf, layerIndex,
-                                   &offsets, nil, 0, &nextInputNormReady)) return NO;
+                                   &offsets, nil, 0, nil, 0, &nextInputNormReady)) return NO;
 
         [cmd commit];
         g_deferredExperts.active = YES;
@@ -3332,46 +3612,26 @@ static BOOL NMOEFullAttentionStateOnlyMetal(nmoe_runtime *rt,
     return YES;
 }
 
-static BOOL NMOELinearAttentionStepMetal(nmoe_runtime *rt,
-                                         int layerIndex,
-                                         const float *residual,
-                                         float *layerOutput,
-                                         size_t position,
-                                         NMOEPerfStats *stats) {
-    (void)position;
-    if (rt == NULL || rt->backend == NULL || residual == NULL || layerOutput == NULL) return NO;
-
+// Encode one linear-attention (GatedDeltaNet) layer's context for the next
+// token: input norm (optional) -> fused QKV/Z/beta/alpha -> conv1d -> q/k norm
+// -> decay/beta -> delta-net state update -> gated norm -> out_proj ->
+// residual -> post norm -> router scores + shared expert gate/up/score.
+// Same outputs as NMOEEncodeFullContext. Advances the conv and delta states.
+static BOOL NMOEEncodeLinearContext(id<MTLCommandBuffer> contextCmd,
+                                    nmoe_runtime *rt,
+                                    int layerIndex,
+                                    void *residualBuf,
+                                    void *outputBuf,
+                                    BOOL doInputNorm) {
     NMOELayerState *state = &rt->layerState[layerIndex];
     const NMOELayerWeights *layer = &rt->layers[layerIndex];
     NSString *lp = [NSString stringWithFormat:@"model.layers.%d", layerIndex];
     NSUInteger convWeightOff = 0;
     if (!NMOEWeightPointerOffset(rt, layer->u.linear.convWeight.weight, &convWeightOff)) return NO;
-    void *residualBuf = NMOEHiddenBufferForPointer(rt, residual);
-    void *outputBuf = NMOEHiddenBufferForPointer(rt, layerOutput);
-    if (residualBuf == NULL || outputBuf == NULL) return NO;
-
-    id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)nmoe_backend_command_queue(rt->backend);
-    if (!NMOEInitExpertIOBuffers(rt)) return NO;
-    BOOL cpuRouter = NMOEUseCPURouter();
-    NMOEExpertLayerFile *expertFile = &state->expertFile;
-    BOOL gpuRoutedExperts = (NMOEUseRoutedExperts() && rt->quantBits == 4 && !cpuRouter &&
-                             expertFile->metalBuffer != NULL && g_expertIOExpertActBuf != NULL);
-
     float invScale = 1.0f / sqrtf((float)kNMOELinearKeyDim);
-
-    // ================================================================
-    // Single unified command buffer: ALL sync GPU ops
-    // input_norm -> QKV/Z/B/A proj -> conv1d -> Q/K norm ->
-    // compute_decay_beta -> delta_net -> gated_rms_norm ->
-    // out_proj -> residual -> post_norm -> router -> shared gate/up/score
-    // ================================================================
-    double t0 = NMOENowSeconds();
-    id<MTLCommandBuffer> contextCmd = [queue commandBuffer];
-    if (contextCmd == nil) return NO;
     {
         // --- input RMS norm ---
-        BOOL deferredInputNorm = NMOEDeferredInputNormReadyForLayer(layerIndex);
-        if (!deferredInputNorm &&
+        if (doInputNorm &&
             !NMOEEncodeRMSNormTensor(contextCmd, rt, &layer->inputNorm,
                                      residualBuf, 0, rt->normBuffer, 0,
                                      kNMOEHiddenDim, YES, 1e-6f)) return NO;
@@ -3495,7 +3755,7 @@ static BOOL NMOELinearAttentionStepMetal(nmoe_runtime *rt,
         if (!NMOEEncodeRMSNormTensor(contextCmd, rt, &layer->postNorm,
                                      outputBuf, 0, rt->normBuffer, 0,
                                      kNMOEHiddenDim, YES, 1e-6f)) return NO;
-        if (rt->quantBits == 4) {
+        if (rt->quantBits == 4 || rt->quantBits == 3) {
             if (!NMOEEncodeRouteSharedQ4Tensors(contextCmd, rt,
                                                 &layer->routerGate, &layer->sharedGateProj,
                                                 &layer->sharedUpProj, &layer->sharedGateScore,
@@ -3511,6 +3771,47 @@ static BOOL NMOELinearAttentionStepMetal(nmoe_runtime *rt,
             if (!NMOEEncodeDequantMatVec(contextCmd, rt, [lp stringByAppendingString:@".mlp.shared_expert_gate"],
                                           rt->normBuffer, 0, rt->sharedOutBuffer, 0, 1u, kNMOEHiddenDim)) return NO;
         }
+    }
+    return YES;
+}
+
+static BOOL NMOELinearAttentionStepMetal(nmoe_runtime *rt,
+                                         int layerIndex,
+                                         const float *residual,
+                                         float *layerOutput,
+                                         size_t position,
+                                         NMOEPerfStats *stats) {
+    (void)position;
+    if (rt == NULL || rt->backend == NULL || residual == NULL || layerOutput == NULL) return NO;
+
+    NMOELayerState *state = &rt->layerState[layerIndex];
+    const NMOELayerWeights *layer = &rt->layers[layerIndex];
+    NSUInteger convWeightOff = 0;
+    if (!NMOEWeightPointerOffset(rt, layer->u.linear.convWeight.weight, &convWeightOff)) return NO;
+    void *residualBuf = NMOEHiddenBufferForPointer(rt, residual);
+    void *outputBuf = NMOEHiddenBufferForPointer(rt, layerOutput);
+    if (residualBuf == NULL || outputBuf == NULL) return NO;
+
+    id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)nmoe_backend_command_queue(rt->backend);
+    if (!NMOEInitExpertIOBuffers(rt)) return NO;
+    BOOL cpuRouter = NMOEUseCPURouter();
+    NMOEExpertLayerFile *expertFile = &state->expertFile;
+    BOOL gpuRoutedExperts = (NMOEUseRoutedExperts() && rt->quantBits == 4 && !cpuRouter &&
+                             expertFile->metalBuffer != NULL && g_expertIOExpertActBuf != NULL);
+
+
+    // ================================================================
+    // Single unified command buffer: ALL sync GPU ops
+    // input_norm -> QKV/Z/B/A proj -> conv1d -> Q/K norm ->
+    // compute_decay_beta -> delta_net -> gated_rms_norm ->
+    // out_proj -> residual -> post_norm -> router -> shared gate/up/score
+    // ================================================================
+    double t0 = NMOENowSeconds();
+    id<MTLCommandBuffer> contextCmd = [queue commandBuffer];
+    if (contextCmd == nil) return NO;
+    if (!NMOEEncodeLinearContext(contextCmd, rt, layerIndex, residualBuf, outputBuf,
+                                 !NMOEDeferredInputNormReadyForLayer(layerIndex))) return NO;
+    {
         if (!cpuRouter && !NMOEEncodeRouteTopK(contextCmd, rt, (size_t)rt->cfg.experts)) return NO;
         if (gpuRoutedExperts) {
             if (!NMOEEncodeDequantMatVecTensor(contextCmd, rt, &layer->sharedDownProj,
@@ -3590,7 +3891,7 @@ static BOOL NMOELinearAttentionStepMetal(nmoe_runtime *rt,
         BOOL nextInputNormReady = NO;
         if (!NMOEEncodeExpertPhase(cmd, rt, layer, expertBuffers, selectedCount, valid,
                                    selectedValues, sharedGateScore, outputBuf, layerIndex,
-                                   &offsets, nil, 0, &nextInputNormReady)) return NO;
+                                   &offsets, nil, 0, nil, 0, &nextInputNormReady)) return NO;
 
         [cmd commit];
         g_deferredExperts.active = YES;
@@ -3786,7 +4087,7 @@ static uint32_t NMOEProcessToken(nmoe_runtime *rt, uint32_t token, BOOL computeL
         (void)NMOERunRMSNormMetal(rt, NMOEModelTensorName(@"model.norm.weight"), NMOEHiddenBufferForPointer(rt, current), 0, rt->normBuffer, 0, kNMOEHiddenDim, YES);
         uint32_t nextToken = 0;
         BOOL gotToken = NO;
-        if (!rt->traceTokens) {
+        if (!rt->traceTokens && !rt->fullLogits) {
             gotToken = NMOERunLmHeadArgmaxQ4Metal(rt, rt->normBuffer, 0, &nextToken);
         }
         if (!gotToken) {
@@ -3804,17 +4105,378 @@ static uint32_t NMOEProcessToken(nmoe_runtime *rt, uint32_t token, BOOL computeL
     return UINT32_MAX;
 }
 
-static uint32_t NMOEProcessPromptAndDecode(nmoe_runtime *rt, NSString *prompt, FILE *output, BOOL quiet, BOOL timing, int maxTokens, NMOEPerfStats *perfOut) {
-    if (rt == NULL || prompt.length == 0) return 0;
-    uint32_t tokenBuffer[4096];
-    int tokenCount = nmoe_tokenizer_encode(rt->tokenizer, prompt.UTF8String, tokenBuffer, 4096);
-    if (tokenCount <= 0) return 0;
+// ============================================================================
+// Batched prefill. Prompt tokens are processed in chunks of up to
+// NMOE_PREFILL_CHUNK (default 32) tokens, layer by layer:
+//   1. one command buffer encodes every token's context (attention, router,
+//      shared expert) back to back, stashing per-token router logits, expert
+//      input, h_mid and shared-expert state -- no CPU round trip per token;
+//   2. the CPU runs top-k per token and preads the UNION of selected experts
+//      once into an expert pool (~2.4 reads/token at chunk 32 instead of 8);
+//   3. pair kernels compute every (token, expert) pair and a combine kernel
+//      writes each token's layer output.
+// Kernels mirror the decode path's arithmetic, so the result is bit-identical
+// to token-by-token prefill. NMOE_BATCH_PREFILL=0 restores the old loop.
+// ============================================================================
+
+typedef struct {
+    uint32_t bits;
+    uint32_t expert_size;
+    uint32_t list_count;
+    uint32_t rows_per_tg;
+    uint32_t gate_weight;
+    uint32_t gate_scales;
+    uint32_t gate_biases;
+    uint32_t up_weight;
+    uint32_t up_scales;
+    uint32_t up_biases;
+    uint32_t down_weight;
+    uint32_t down_scales;
+    uint32_t down_biases;
+    uint32_t token_count;
+    uint32_t reserved0;
+    uint32_t reserved1;
+} NMOEPrefillArgs;
+
+typedef struct {
+    id<MTLBuffer> hidden;     // [chunk][2048] layer input/output per token
+    id<MTLBuffer> hmid;       // [chunk][2048] residual after attention
+    id<MTLBuffer> xin;        // [chunk][2048] post-attention norm (expert input)
+    id<MTLBuffer> scores;     // [chunk][256] router logits
+    id<MTLBuffer> sharedAct;  // [chunk][512]
+    id<MTLBuffer> sharedGate; // [chunk]
+    id<MTLBuffer> act;        // [chunk*8][512]
+    id<MTLBuffer> pairOut;    // [chunk*8][2048]
+    id<MTLBuffer> weights;    // [chunk][8]
+    id<MTLBuffer> kept;       // [chunk] uint
+    id<MTLBuffer> pairList;   // [chunk*8] uint
+    id<MTLBuffer> pairSlot;   // [chunk*8] uint
+    id<MTLBuffer> pool;       // [poolSlots][expertSize]
+    size_t chunk;
+    size_t poolSlots;
+    size_t expertSize;
+} NMOEPrefillState;
+
+static NMOEPrefillState g_prefill;
+static id<MTLSharedEvent> g_prefillEvent = nil;
+static uint64_t g_prefillEventValue = 0;
+
+static size_t NMOEEnvSize(const char *name, size_t fallback, size_t lo, size_t hi) {
+    const char *value = getenv(name);
+    if (value == NULL || value[0] == '\0') return fallback;
+    long v = strtol(value, NULL, 10);
+    if (v < (long)lo) v = (long)lo;
+    if (v > (long)hi) v = (long)hi;
+    return (size_t)v;
+}
+
+static BOOL NMOEUseBatchedPrefill(nmoe_runtime *rt) {
+    if (rt->quantBits != 3 && rt->quantBits != 4) return NO;
+    const char *value = getenv("NMOE_BATCH_PREFILL");
+    if (value == NULL || value[0] == '\0') return YES;
+    return !(value[0] == '0' || value[0] == 'f' || value[0] == 'F' ||
+             value[0] == 'n' || value[0] == 'N');
+}
+
+static BOOL NMOEPrefillInit(nmoe_runtime *rt) {
+    if (g_prefill.hidden != nil && g_prefill.expertSize == g_expertIOSize) return YES;
+    id<MTLDevice> device = (__bridge id<MTLDevice>)nmoe_backend_device(rt->backend);
+    if (device == nil || g_expertIOSize == 0) return NO;
+    size_t T = NMOEEnvSize("NMOE_PREFILL_CHUNK", 32, 1, 64);
+    size_t slots = NMOEEnvSize("NMOE_PREFILL_POOL", 96, 8, 256);
+    MTLResourceOptions opt = MTLResourceStorageModeShared;
+    g_prefill.chunk = T;
+    g_prefill.poolSlots = slots;
+    g_prefill.expertSize = g_expertIOSize;
+    g_prefill.hidden = [device newBufferWithLength:T * kNMOEHiddenDim * sizeof(float) options:opt];
+    g_prefill.hmid = [device newBufferWithLength:T * kNMOEHiddenDim * sizeof(float) options:opt];
+    g_prefill.xin = [device newBufferWithLength:T * kNMOEHiddenDim * sizeof(float) options:opt];
+    g_prefill.scores = [device newBufferWithLength:T * 256u * sizeof(float) options:opt];
+    g_prefill.sharedAct = [device newBufferWithLength:T * 512u * sizeof(float) options:opt];
+    g_prefill.sharedGate = [device newBufferWithLength:T * sizeof(float) options:opt];
+    g_prefill.act = [device newBufferWithLength:T * 8u * 512u * sizeof(float) options:opt];
+    g_prefill.pairOut = [device newBufferWithLength:T * 8u * kNMOEHiddenDim * sizeof(float) options:opt];
+    g_prefill.weights = [device newBufferWithLength:T * 8u * sizeof(float) options:opt];
+    g_prefill.kept = [device newBufferWithLength:T * sizeof(uint32_t) options:opt];
+    g_prefill.pairList = [device newBufferWithLength:T * 8u * sizeof(uint32_t) options:opt];
+    g_prefill.pairSlot = [device newBufferWithLength:T * 8u * sizeof(uint32_t) options:opt];
+    g_prefill.pool = [device newBufferWithLength:slots * g_expertIOSize options:opt];
+    if (g_prefillEvent == nil) g_prefillEvent = [device newSharedEvent];
+    return g_prefill.hidden != nil && g_prefill.pairOut != nil && g_prefill.pool != nil;
+}
+
+static void NMOEBlitCopy(id<MTLBlitCommandEncoder> blit, void *src, size_t srcOff, id<MTLBuffer> dst, size_t dstOff, size_t bytes) {
+    [blit copyFromBuffer:NMOEBridgeBuffer(src) sourceOffset:srcOff toBuffer:dst destinationOffset:dstOff size:bytes];
+}
+
+static NMOEPrefillArgs NMOEPrefillArgsMake(nmoe_runtime *rt, uint32_t listCount, uint32_t tokenCount) {
+    const NMOEExpertOffsets *o = NMOEExpertOffsetsForBits(rt->quantBits);
+    NMOEPrefillArgs args = {
+        .bits = (uint32_t)rt->quantBits,
+        .expert_size = (uint32_t)g_prefill.expertSize,
+        .list_count = listCount,
+        .rows_per_tg = 8u,
+        .gate_weight = (uint32_t)o->gate_weight, .gate_scales = (uint32_t)o->gate_scales, .gate_biases = (uint32_t)o->gate_biases,
+        .up_weight = (uint32_t)o->up_weight, .up_scales = (uint32_t)o->up_scales, .up_biases = (uint32_t)o->up_biases,
+        .down_weight = (uint32_t)o->down_weight, .down_scales = (uint32_t)o->down_scales, .down_biases = (uint32_t)o->down_biases,
+        .token_count = tokenCount,
+    };
+    return args;
+}
+
+static BOOL NMOEPrefillChunk(nmoe_runtime *rt, const uint32_t *tokens, size_t T, NMOEPerfStats *stats) {
+    id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)nmoe_backend_command_queue(rt->backend);
+    id<MTLComputePipelineState> gateUpPipe = (__bridge id<MTLComputePipelineState>)nmoe_backend_pipeline_state(rt->backend, NMOE_BACKEND_KERNEL_PREFILL_EXPERT_GATE_UP);
+    id<MTLComputePipelineState> downPipe = (__bridge id<MTLComputePipelineState>)nmoe_backend_pipeline_state(rt->backend, NMOE_BACKEND_KERNEL_PREFILL_EXPERT_DOWN);
+    id<MTLComputePipelineState> combinePipe = (__bridge id<MTLComputePipelineState>)nmoe_backend_pipeline_state(rt->backend, NMOE_BACKEND_KERNEL_PREFILL_COMBINE);
+    id<MTLBuffer> weightBuffer = (__bridge id<MTLBuffer>)nmoe_backend_weight_buffer(rt->backend);
+    if (queue == nil || gateUpPipe == nil || downPipe == nil || combinePipe == nil || weightBuffer == nil) return NO;
+    NMOEFinalizeDeferredExperts(rt);
+
+    const size_t D = kNMOEHiddenDim;
+    const size_t startPos = rt->sequencePosition;
+    const size_t K = (size_t)MAX(1, MIN(rt->cfg.experts, (int)kNMOEMaxExperts));
+    const size_t esz = g_prefill.expertSize;
+    void *hb0 = rt->hiddenBuffers[0];
+    void *hb1 = rt->hiddenBuffers[1];
+
+    for (size_t t = 0; t < T; ++t) {
+        if (!NMOERunDequantRowMetal(rt, @"model.embed_tokens", (size_t)tokens[t],
+                                    (__bridge void *)g_prefill.hidden, t * D * sizeof(float), D, 4)) return NO;
+    }
+
+    float *weights = (float *)g_prefill.weights.contents;
+    uint32_t *kept = (uint32_t *)g_prefill.kept.contents;
+    uint32_t *pairList = (uint32_t *)g_prefill.pairList.contents;
+    uint32_t *pairSlot = (uint32_t *)g_prefill.pairSlot.contents;
+    const float *scoresAll = (const float *)g_prefill.scores.contents;
+    uint8_t *pool = (uint8_t *)g_prefill.pool.contents;
+    id<MTLCommandBuffer> lastCmd = nil;
+
+    for (int layerIndex = 0; layerIndex < (int)kNMOELayers; ++layerIndex) {
+        const NMOELayerWeights *layer = &rt->layers[layerIndex];
+        NMOEExpertLayerFile *expertFile = &rt->layerState[layerIndex].expertFile;
+
+        // ---- 1. context for every token, one command buffer. After each
+        // token the GPU signals g_prefillEvent so the CPU can route that token
+        // and start reading its experts while later tokens are still running.
+        double t0 = NMOENowSeconds();
+        id<MTLCommandBuffer> cmd = [queue commandBuffer];
+        if (cmd == nil) return NO;
+        uint64_t evBase = g_prefillEventValue;
+        for (size_t t = 0; t < T; ++t) {
+            id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+            [blit copyFromBuffer:g_prefill.hidden sourceOffset:t * D * sizeof(float)
+                        toBuffer:NMOEBridgeBuffer(hb0) destinationOffset:0 size:D * sizeof(float)];
+            [blit endEncoding];
+            BOOL ok = layer->isFull
+                ? NMOEEncodeFullContext(cmd, rt, layerIndex, hb0, hb1, startPos + t, YES)
+                : NMOEEncodeLinearContext(cmd, rt, layerIndex, hb0, hb1, YES);
+            if (!ok) return NO;
+            blit = [cmd blitCommandEncoder];
+            NMOEBlitCopy(blit, hb1, 0, g_prefill.hmid, t * D * sizeof(float), D * sizeof(float));
+            NMOEBlitCopy(blit, rt->normBuffer, 0, g_prefill.xin, t * D * sizeof(float), D * sizeof(float));
+            NMOEBlitCopy(blit, rt->routerScoresBuffer, 0, g_prefill.scores, t * 256u * sizeof(float), 256u * sizeof(float));
+            NMOEBlitCopy(blit, g_expertIOSharedActBuf, 0, g_prefill.sharedAct, t * 512u * sizeof(float), 512u * sizeof(float));
+            NMOEBlitCopy(blit, rt->sharedOutBuffer, 0, g_prefill.sharedGate, t * sizeof(float), sizeof(float));
+            [blit endEncoding];
+            [cmd encodeSignalEvent:g_prefillEvent value:evBase + t + 1];
+        }
+        g_prefillEventValue = evBase + T;
+        [cmd commit];
+
+        // ---- 2. per token as it lands: route (same math as
+        // NMOESelectRouteTopKCPU) and issue async reads of newly seen experts
+        // into free pool slots. Experts that do not fit are read in later rounds.
+        int expertSlotOf[256];
+        for (int e = 0; e < 256; ++e) expertSlotOf[e] = -1;
+        size_t unionList[256];
+        size_t unionCount = 0;
+        size_t pairExpert[64 * 8];
+        size_t slotsUsed = 0;
+        dispatch_group_t ioGroup = dispatch_group_create();
+        dispatch_queue_t ioQueue = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+        __block int readFailed = 0;
+        int fd = expertFile->fd;
+        double routeTime = 0.0;
+        for (size_t t = 0; t < T; ++t) {
+            if (![g_prefillEvent waitUntilSignaledValue:evBase + t + 1 timeoutMS:60000]) return NO;
+            double tr = NMOENowSeconds();
+            float probs[256];
+            memcpy(probs, scoresAll + t * 256u, sizeof(probs));
+            nmoe_cpu_softmax(probs, 256u);
+            size_t idx[kNMOEMaxExperts] = {0};
+            float val[kNMOEMaxExperts] = {0};
+            size_t n = nmoe_cpu_topk(probs, 256u, K, idx, val);
+            nmoe_cpu_renormalize(val, n);
+            NMOETraceRoute(layerIndex, idx, val, n);
+            n = NMOEPruneRoute(n, val);
+            kept[t] = (uint32_t)n;
+            for (size_t k = 0; k < 8; ++k) {
+                weights[t * 8 + k] = k < n ? val[k] : 0.0f;
+                pairExpert[t * 8 + k] = k < n ? idx[k] : SIZE_MAX;
+                if (k >= n || expertSlotOf[idx[k]] != -1) continue;
+                unionList[unionCount++] = idx[k];
+                if (slotsUsed < g_prefill.poolSlots) {
+                    size_t slot = slotsUsed++;
+                    expertSlotOf[idx[k]] = (int)slot;
+                    size_t e = idx[k];
+                    dispatch_group_async(ioGroup, ioQueue, ^{
+                        uint8_t *dst = pool + slot * esz;
+                        size_t remaining = esz;
+                        off_t pos = (off_t)(e * esz);
+                        while (remaining > 0) {
+                            ssize_t rc = pread(fd, dst, remaining, pos);
+                            if (rc <= 0) { readFailed = 1; break; }
+                            dst += rc; pos += rc; remaining -= (size_t)rc;
+                        }
+                    });
+                } else {
+                    expertSlotOf[idx[k]] = -2; // overflow: read in a later round
+                }
+            }
+            routeTime += NMOENowSeconds() - tr;
+        }
+        [cmd waitUntilCompleted];
+        if (cmd.error != nil) return NO;
+        if (stats != NULL) {
+            stats->context += NMOENowSeconds() - t0 - routeTime;
+            stats->route += routeTime;
+        }
+        double tio = NMOENowSeconds();
+        dispatch_group_wait(ioGroup, DISPATCH_TIME_FOREVER);
+        if (stats != NULL) stats->expertFetch += NMOENowSeconds() - tio;
+        if (readFailed || unionCount == 0) return NO;
+
+        // ---- 3. pair kernels per round. Round 0 = experts already streamed
+        // into the pool; overflow experts reuse the pool in later rounds.
+        size_t roundStart = 0;
+        size_t roundCount = slotsUsed;
+        for (;;) {
+            BOOL lastRound = (roundStart + roundCount >= unionCount);
+            uint32_t listCount = 0;
+            for (size_t p = 0; p < T * 8; ++p) {
+                size_t e = pairExpert[p];
+                if (e == SIZE_MAX) continue;
+                size_t pos = 0;
+                while (unionList[pos] != e) pos++;
+                if (pos < roundStart || pos >= roundStart + roundCount) continue;
+                pairSlot[p] = (uint32_t)expertSlotOf[e];
+                pairList[listCount++] = (uint32_t)p;
+            }
+
+            id<MTLCommandBuffer> ecmd = [queue commandBuffer];
+            if (ecmd == nil) return NO;
+            NMOEPrefillArgs args = NMOEPrefillArgsMake(rt, listCount, (uint32_t)T);
+            if (listCount > 0) {
+                if (!NMOEEncodeKernelTG(ecmd, gateUpPipe, (NSUInteger)listCount * (512u / 8u), 256, ^(id<MTLComputeCommandEncoder> enc) {
+                    [enc setBuffer:g_prefill.pool offset:0 atIndex:0];
+                    [enc setBuffer:g_prefill.xin offset:0 atIndex:1];
+                    [enc setBuffer:g_prefill.act offset:0 atIndex:2];
+                    [enc setBuffer:g_prefill.pairList offset:0 atIndex:3];
+                    [enc setBuffer:g_prefill.pairSlot offset:0 atIndex:4];
+                    [enc setBytes:&args length:sizeof(args) atIndex:5];
+                })) return NO;
+                if (!NMOEEncodeKernelTG(ecmd, downPipe, (NSUInteger)listCount * (kNMOEHiddenDim / 8u), 256, ^(id<MTLComputeCommandEncoder> enc) {
+                    [enc setBuffer:g_prefill.pool offset:0 atIndex:0];
+                    [enc setBuffer:g_prefill.act offset:0 atIndex:1];
+                    [enc setBuffer:g_prefill.pairOut offset:0 atIndex:2];
+                    [enc setBuffer:g_prefill.pairList offset:0 atIndex:3];
+                    [enc setBuffer:g_prefill.pairSlot offset:0 atIndex:4];
+                    [enc setBytes:&args length:sizeof(args) atIndex:5];
+                })) return NO;
+            }
+            if (lastRound) {
+                NSUInteger sw = 0, ss = 0, sb = 0;
+                if (!NMOEWeightPointerOffset(rt, layer->sharedDownProj.weight, &sw) ||
+                    !NMOEWeightPointerOffset(rt, layer->sharedDownProj.scales, &ss) ||
+                    !NMOEWeightPointerOffset(rt, layer->sharedDownProj.biases, &sb)) return NO;
+                if (!NMOEEncodeKernelTG(ecmd, combinePipe, (NSUInteger)T * (kNMOEHiddenDim / 8u), 256, ^(id<MTLComputeCommandEncoder> enc) {
+                    [enc setBuffer:g_prefill.pairOut offset:0 atIndex:0];
+                    [enc setBuffer:g_prefill.hmid offset:0 atIndex:1];
+                    [enc setBuffer:g_prefill.hidden offset:0 atIndex:2];
+                    [enc setBuffer:g_prefill.weights offset:0 atIndex:3];
+                    [enc setBuffer:g_prefill.kept offset:0 atIndex:4];
+                    [enc setBuffer:g_prefill.sharedGate offset:0 atIndex:5];
+                    [enc setBuffer:weightBuffer offset:sw atIndex:6];
+                    [enc setBuffer:weightBuffer offset:ss atIndex:7];
+                    [enc setBuffer:weightBuffer offset:sb atIndex:8];
+                    [enc setBuffer:g_prefill.sharedAct offset:0 atIndex:9];
+                    [enc setBytes:&args length:sizeof(args) atIndex:10];
+                })) return NO;
+            }
+            [ecmd commit];
+            lastCmd = ecmd;
+            // After the last round the next layer's context buffer follows on
+            // the same queue; otherwise the pool is about to be overwritten.
+            if (lastRound) break;
+            [ecmd waitUntilCompleted];
+            if (ecmd.error != nil) return NO;
+
+            roundStart += roundCount;
+            roundCount = MIN(g_prefill.poolSlots, unionCount - roundStart);
+            const size_t *roundExperts = unionList + roundStart;
+            for (size_t j = 0; j < roundCount; ++j) expertSlotOf[roundExperts[j]] = (int)j;
+            tio = NMOENowSeconds();
+            dispatch_apply(roundCount, ioQueue, ^(size_t j) {
+                uint8_t *dst = pool + j * esz;
+                size_t remaining = esz;
+                off_t pos = (off_t)(roundExperts[j] * esz);
+                while (remaining > 0) {
+                    ssize_t rc = pread(fd, dst, remaining, pos);
+                    if (rc <= 0) { readFailed = 1; break; }
+                    dst += rc; pos += rc; remaining -= (size_t)rc;
+                }
+            });
+            if (stats != NULL) stats->expertFetch += NMOENowSeconds() - tio;
+            if (readFailed) return NO;
+        }
+    }
+    if (lastCmd != nil) {
+        [lastCmd waitUntilCompleted];
+        if (lastCmd.error != nil) return NO;
+    }
+    rt->sequencePosition += T;
+    return YES;
+}
+
+// Run `count` prompt tokens through the model without computing logits.
+static BOOL NMOEPrefillTokens(nmoe_runtime *rt, const uint32_t *tokens, int count, NMOEPerfStats *perf) {
+    if (count <= 0) return YES;
+    if (!NMOEUseBatchedPrefill(rt) || !NMOEInitExpertIOBuffers(rt) || !NMOEPrefillInit(rt)) {
+        for (int i = 0; i < count; ++i) (void)NMOEProcessToken(rt, tokens[i], NO, perf);
+        return YES;
+    }
+    NMOEPerfStats prefillStats = {0};
+    double start = NMOENowSeconds();
+    for (int i = 0; i < count; i += (int)g_prefill.chunk) {
+        size_t n = MIN(g_prefill.chunk, (size_t)(count - i));
+        if (!NMOEPrefillChunk(rt, tokens + i, n, &prefillStats)) {
+            fprintf(stderr, "nmoe runtime error: batched prefill failed\n");
+            abort();
+        }
+    }
+    double elapsed = NMOENowSeconds() - start;
+    if (rt->cfg.timing) {
+        fprintf(stderr, "timing: prefill tokens=%d ms=%.1f tok_s=%.2f context_ms=%.1f route_ms=%.1f expert_fetch_ms=%.1f\n",
+                count, elapsed * 1000.0, count / (elapsed > 0 ? elapsed : 1e-9),
+                prefillStats.context * 1000.0, prefillStats.route * 1000.0, prefillStats.expertFetch * 1000.0);
+    }
+    return YES;
+}
+
+// Feed `tokenCount` tokens at the current sequence position (no reset), then
+// generate up to maxTokens. Returns the last predicted token, which has NOT
+// been fed into the model (EOS, or the token that hit the limit), or
+// UINT32_MAX when maxTokens <= 0 (prefill only).
+static uint32_t NMOEDecodeTokens(nmoe_runtime *rt, const uint32_t *tokenBuffer, int tokenCount, FILE *output, BOOL quiet, BOOL timing, int maxTokens, NMOEPerfStats *perfOut) {
+    if (rt == NULL || tokenBuffer == NULL || tokenCount <= 0) return 0;
     NMOETracePromptTokens(rt, tokenBuffer, tokenCount);
     double startTime = NMOENowSeconds();
-    rt->sequencePosition = 0; rt->inThink = NO; rt->thinkCount = 0;
+    rt->inThink = NO; rt->thinkCount = 0;
     NMOEPerfStats perf = {0};
-    for (int i = 0; i < tokenCount - 1; ++i) (void)NMOEProcessToken(rt, tokenBuffer[i], NO, &perf);
-    if (maxTokens <= 0) { (void)NMOEProcessToken(rt, tokenBuffer[tokenCount-1], NO, &perf); if (perfOut) *perfOut = perf; return UINT32_MAX; }
+    if (maxTokens <= 0) { (void)NMOEPrefillTokens(rt, tokenBuffer, tokenCount, &perf); if (perfOut) *perfOut = perf; return UINT32_MAX; }
+    (void)NMOEPrefillTokens(rt, tokenBuffer, tokenCount - 1, &perf);
     uint32_t nextToken = NMOEProcessToken(rt, tokenBuffer[tokenCount-1], YES, &perf);
 
     if (nextToken == UINT32_MAX) nextToken = 0;
@@ -3841,7 +4503,7 @@ static uint32_t NMOEProcessPromptAndDecode(nmoe_runtime *rt, NSString *prompt, F
     double decodeElapsed = NMOENowSeconds() - decodeStartTime;
     double decodeTokS = (generated > 1 && decodeElapsed > 0.0) ? (double)(generated - 1) / decodeElapsed : 0.0;
     if (timing && output) fprintf(output, "timing: mode=ask quant=%s experts=%d tokens=%d tok_s=%.3f decode_tok_s=%.3f\n",
-            rt->quantBits == 2 ? "q2" : "q4", rt->cfg.experts, generated,
+            rt->quantBits == 2 ? "q2" : (rt->quantBits == 3 ? "q3" : "q4"), rt->cfg.experts, generated,
             generated / (elapsed > 0 ? elapsed : 0.001), decodeTokS);
     if (timing && perf.layerCount > 0) {
         double n = (double)perf.layerCount;
@@ -3856,6 +4518,15 @@ static uint32_t NMOEProcessPromptAndDecode(nmoe_runtime *rt, NSString *prompt, F
                 (perf.expertFetch * 1000.0) / n,
                 (perf.expert * 1000.0) / n,
                 totalLayerMs);
+        if (g_residencyPagesTotal > 0) {
+            fprintf(stderr, "timing: expert_page_cache_hit=%.3f\n",
+                    (double)g_residencyPagesResident / (double)g_residencyPagesTotal);
+        }
+        if (g_routeSelectedTotal > 0) {
+            fprintf(stderr, "timing: experts_loaded_avg=%.3f of %d\n",
+                    (double)g_routeKeptTotal / (double)(g_routeSelectedTotal) * (double)rt->cfg.experts,
+                    rt->cfg.experts);
+        }
         fprintf(stderr,
                 "timing: decode_est ms_per_token=%.3f tok_s=%.3f\n",
                 decodeMsPerToken,
@@ -3896,6 +4567,96 @@ static uint32_t NMOEProcessPromptAndDecode(nmoe_runtime *rt, NSString *prompt, F
     return nextToken;
 }
 
+static uint32_t NMOEProcessPromptAndDecode(nmoe_runtime *rt, NSString *prompt, FILE *output, BOOL quiet, BOOL timing, int maxTokens, NMOEPerfStats *perfOut) {
+    if (rt == NULL || prompt.length == 0) return 0;
+    static uint32_t tokenBuffer[4096];
+    int tokenCount = nmoe_tokenizer_encode(rt->tokenizer, prompt.UTF8String, tokenBuffer, 4096);
+    if (tokenCount <= 0) return 0;
+    rt->sequencePosition = 0;
+    return NMOEDecodeTokens(rt, tokenBuffer, tokenCount, output, quiet, timing, maxTokens, perfOut);
+}
+
+// Teacher-forced evaluation over a raw text file (no chat template). Reports
+// perplexity and top-1 accuracy of next-token prediction. NMOE_PPL_DUMP=path
+// writes, per scored position, {u32 target, f32 target_logprob, u32 ids[32],
+// f32 logprobs[32]} so two configurations can be compared (KL, top-1 agreement)
+// with scripts/ppl_compare.py.
+enum { kNMOEPplTopN = 32 };
+
+static int NMOERunPerplexity(nmoe_runtime *rt) {
+    const char *path = rt->cfg.prompt;
+    NSError *readError = nil;
+    NSString *text = path ? [NSString stringWithContentsOfFile:NMOEStringFromC(path) encoding:NSUTF8StringEncoding error:&readError] : nil;
+    if (text == nil) {
+        fprintf(stderr, "ppl: cannot read %s\n", path ? path : "(null)");
+        return 1;
+    }
+    static uint32_t tokens[4096];
+    int tokenCount = nmoe_tokenizer_encode(rt->tokenizer, text.UTF8String, tokens, 4096);
+    if (rt->cfg.tokens_set && rt->cfg.max_tokens > 1 && rt->cfg.max_tokens < tokenCount) tokenCount = rt->cfg.max_tokens;
+    if (tokenCount < 2) {
+        fprintf(stderr, "ppl: need at least 2 tokens\n");
+        return 1;
+    }
+    const char *dumpPath = getenv("NMOE_PPL_DUMP");
+    FILE *dump = (dumpPath != NULL && dumpPath[0] != '\0') ? fopen(dumpPath, "wb") : NULL;
+
+    NMOEResetState(rt);
+    rt->sequencePosition = 0; rt->inThink = NO; rt->thinkCount = 0;
+    rt->fullLogits = YES;
+    double nllSum = 0.0;
+    int correct = 0;
+    int scored = 0;
+    double start = NMOENowSeconds();
+    for (int i = 0; i + 1 < tokenCount; ++i) {
+        (void)NMOEProcessToken(rt, tokens[i], YES, NULL);
+        const float *logits = NMOEFloatBuffer(rt->logitsBuffer);
+        float maxv = -INFINITY;
+        uint32_t argmax = 0;
+        for (uint32_t v = 0; v < 248320u; ++v) if (logits[v] > maxv) { maxv = logits[v]; argmax = v; }
+        double sum = 0.0;
+        for (uint32_t v = 0; v < 248320u; ++v) sum += exp((double)(logits[v] - maxv));
+        double logZ = (double)maxv + log(sum);
+        uint32_t target = tokens[i + 1];
+        double lp = (double)logits[target] - logZ;
+        nllSum -= lp;
+        correct += (argmax == target);
+        scored += 1;
+        if (dump != NULL) {
+            uint32_t ids[kNMOEPplTopN];
+            float vals[kNMOEPplTopN];
+            for (int t = 0; t < kNMOEPplTopN; ++t) { ids[t] = 0; vals[t] = -INFINITY; }
+            for (uint32_t v = 0; v < 248320u; ++v) {
+                float x = logits[v];
+                if (x <= vals[kNMOEPplTopN - 1]) continue;
+                int slot = kNMOEPplTopN - 1;
+                while (slot > 0 && x > vals[slot - 1]) { vals[slot] = vals[slot - 1]; ids[slot] = ids[slot - 1]; slot--; }
+                vals[slot] = x; ids[slot] = v;
+            }
+            float lps[kNMOEPplTopN];
+            for (int t = 0; t < kNMOEPplTopN; ++t) lps[t] = (float)((double)vals[t] - logZ);
+            float lpf = (float)lp;
+            fwrite(&target, sizeof(target), 1, dump);
+            fwrite(&lpf, sizeof(lpf), 1, dump);
+            fwrite(ids, sizeof(ids), 1, dump);
+            fwrite(lps, sizeof(lps), 1, dump);
+        }
+        if (!rt->quiet && (scored % 32) == 0) {
+            fprintf(stderr, "ppl: %d/%d running_ppl=%.4f\n", scored, tokenCount - 1, exp(nllSum / scored));
+        }
+    }
+    double elapsed = NMOENowSeconds() - start;
+    rt->fullLogits = NO;
+    if (dump != NULL) fclose(dump);
+    printf("ppl: tokens=%d ppl=%.4f nll=%.5f top1=%.4f tok_s=%.3f",
+           scored, exp(nllSum / scored), nllSum / scored, (double)correct / scored, scored / elapsed);
+    if (g_routeSelectedTotal > 0) {
+        printf(" experts_loaded_avg=%.3f", (double)g_routeKeptTotal / (double)g_routeSelectedTotal * (double)rt->cfg.experts);
+    }
+    printf("\n");
+    return 0;
+}
+
 static int NMOERunAskLike(nmoe_runtime *rt, BOOL benchMode, FILE *output) {
     NSString *prompt = rt->cfg.prompt ? NMOEStringFromC(rt->cfg.prompt) : @"";
     if (prompt.length == 0) prompt = @"";
@@ -3903,7 +4664,7 @@ static int NMOERunAskLike(nmoe_runtime *rt, BOOL benchMode, FILE *output) {
     NMOEResetState(rt);
     NMOEPerfStats perf = {0};
     uint32_t token = NMOEProcessPromptAndDecode(rt, runtimePrompt, output, rt->quiet, rt->cfg.timing, rt->cfg.max_tokens, &perf);
-    if (benchMode && output) fprintf(output, "bench: quant=%s tok_s=%.3f\n", rt->quantBits == 2 ? "q2" : "q4", 0.0);
+    if (benchMode && output) fprintf(output, "bench: quant=%s tok_s=%.3f\n", rt->quantBits == 2 ? "q2" : (rt->quantBits == 3 ? "q3" : "q4"), 0.0);
     if (!rt->quiet && output) {
         fputc('\n', output);
         fflush(output);
@@ -3948,20 +4709,65 @@ int nmoe_runtime_run(nmoe_runtime *rt) {
     if (rt == NULL) return 1;
     if (rt->cfg.mode == NMOE_RUN_ASK || rt->cfg.mode == NMOE_RUN_BENCH) return NMOERunAskLike(rt, rt->cfg.mode == NMOE_RUN_BENCH, stdout);
     if (rt->cfg.mode == NMOE_RUN_CHAT) return NMOERunChat(rt);
+    if (rt->cfg.mode == NMOE_RUN_PPL) return NMOERunPerplexity(rt);
     return 0;
 }
 
-static int NMOERunChat(nmoe_runtime *rt) {
-    NSString *systemPrompt = NMOEChatSystemPrompt();
+// Multi-turn chat: the system prompt is prefilled once and every turn is
+// appended to the same KV/linear state, so the model sees the whole
+// conversation. The last generated token of a turn (EOS or the token that hit
+// the limit) has not been fed yet; it is fed at the start of the next turn
+// together with the <|im_end|> that closes the assistant message. When the
+// context would overflow, the conversation restarts. "/reset" clears it.
+static int NMOEChatPrefillSystem(nmoe_runtime *rt, uint32_t *tokens, int capacity) {
     NMOEResetState(rt);
-    (void)NMOEProcessPromptAndDecode(rt, systemPrompt, stdout, YES, NO, 0, NULL);
+    int n = nmoe_tokenizer_encode(rt->tokenizer, NMOEChatSystemPrompt().UTF8String, tokens, capacity);
+    if (n > 0) (void)NMOEDecodeTokens(rt, tokens, n, stdout, YES, NO, 0, NULL);
+    return n;
+}
+
+static int NMOERunChat(nmoe_runtime *rt) {
+    static uint32_t tokens[4096];
+    const int capacity = 4096;
+    NMOEChatPrefillSystem(rt, tokens, capacity);
+    uint32_t pending = UINT32_MAX; // last generated token, not yet fed
     while (1) {
         fprintf(stdout, "\n> "); fflush(stdout);
         char line[4096];
         if (fgets(line, sizeof(line), stdin) == NULL) break;
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
+        if (len == 0) continue;
+        if (strcmp(line, "/reset") == 0) {
+            NMOEChatPrefillSystem(rt, tokens, capacity);
+            pending = UINT32_MAX;
+            fprintf(stdout, "[conversation cleared]\n");
+            continue;
+        }
         NSString *userPrompt = NMOEChatUserPrompt(NMOEStringFromC(line));
-        NMOEResetState(rt);
-        (void)NMOEProcessPromptAndDecode(rt, userPrompt, stdout, NO, rt->cfg.timing, rt->cfg.max_tokens, NULL);
+
+        int n = 0;
+        NSString *closing = @"";
+        if (pending == kNMOEEOS1) {
+            tokens[n++] = pending;               // <|im_end|>
+            closing = @"\n";
+        } else if (pending != UINT32_MAX) {
+            if (pending != kNMOEEOS2) tokens[n++] = pending; // truncated reply
+            closing = @"<|im_end|>\n";
+        }
+        NSString *turn = [closing stringByAppendingString:userPrompt];
+        int m = nmoe_tokenizer_encode(rt->tokenizer, turn.UTF8String, tokens + n, capacity - n);
+        if (m <= 0) continue;
+        n += m;
+
+        size_t needed = rt->sequencePosition + (size_t)n + (size_t)MAX(rt->cfg.max_tokens, 0) + 8u;
+        if (needed > rt->sequenceCapacity) {
+            fprintf(stdout, "[context full, starting a new conversation]\n");
+            NMOEChatPrefillSystem(rt, tokens, capacity);
+            n = nmoe_tokenizer_encode(rt->tokenizer, userPrompt.UTF8String, tokens, capacity);
+            if (n <= 0) { pending = UINT32_MAX; continue; }
+        }
+        pending = NMOEDecodeTokens(rt, tokens, n, stdout, NO, rt->cfg.timing, rt->cfg.max_tokens, NULL);
         fprintf(stdout, "\n"); fflush(stdout);
     }
     return 0;
