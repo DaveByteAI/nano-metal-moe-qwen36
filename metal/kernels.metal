@@ -1725,6 +1725,253 @@ kernel void nmoe_expert_down_combine_q3(
 }
 
 // ============================================================================
+// Batched prefill MoE. A chunk of T prompt tokens selects up to T*8 (token,
+// expert) pairs; pair id p = token*8 + k. The union of selected experts is
+// pread once into an expert pool (slot = pair_slot[p]) and processed in rounds
+// of at most pool-size experts; pair_list holds the pair ids of the current
+// round. Inner loops mirror the decode kernels (nmoe_expert_gate_up_q{3,4}_
+// batched / nmoe_expert_down_combine_q{3,4}) exactly so prefill is bit-
+// identical to token-by-token processing.
+// ============================================================================
+
+struct NMOEPrefillArgs {
+    uint bits;
+    uint expert_size;
+    uint list_count;
+    uint rows_per_tg;
+    uint gate_weight;
+    uint gate_scales;
+    uint gate_biases;
+    uint up_weight;
+    uint up_scales;
+    uint up_biases;
+    uint down_weight;
+    uint down_scales;
+    uint down_biases;
+    uint token_count;
+    uint reserved0;
+    uint reserved1;
+};
+
+static inline float nmoe_q4_row_dot_shared(const device uint *row, const device ushort *scale_row,
+                                           const device ushort *bias_row, const threadgroup float *x,
+                                           uint packed_cols, uint in_dim, uint simd_lane)
+{
+    float acc = 0.0f;
+    for (uint pi = simd_lane; pi < packed_cols; pi += 32u) {
+        uint base_col = pi * 8u;
+        uint group = base_col / 64u;
+        float scale = nmoe_bf16_to_f32(scale_row[group]);
+        float bias = nmoe_bf16_to_f32(bias_row[group]);
+        uint word = row[pi];
+        for (uint lane = 0u; lane < 8u; ++lane) {
+            uint col = base_col + lane;
+            if (col >= in_dim) break;
+            acc += fma((float)((word >> (lane * 4u)) & 0xFu), scale, bias) * x[col];
+        }
+    }
+    return acc;
+}
+
+kernel void nmoe_prefill_expert_gate_up(
+    const device uchar *pool [[buffer(0)]],
+    const device float *xin [[buffer(1)]],
+    device float *act [[buffer(2)]],
+    const device uint *pair_list [[buffer(3)]],
+    const device uint *pair_slot [[buffer(4)]],
+    constant NMOEPrefillArgs &args [[buffer(5)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]])
+{
+    const uint out_rows = 512u;
+    const uint in_dim = 2048u;
+    uint rows_per_tg = args.rows_per_tg;
+    uint row_groups = (out_rows + rows_per_tg - 1u) / rows_per_tg;
+    uint list_idx = tgid / row_groups;
+    if (list_idx >= args.list_count) return;
+    uint pair = pair_list[list_idx];
+    uint token = pair / 8u;
+
+    threadgroup float x_shared[2048];
+    for (uint i = lid; i < in_dim; i += rows_per_tg * 32u) {
+        x_shared[i] = xin[token * in_dim + i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group >= rows_per_tg) return;
+    uint row = (tgid - list_idx * row_groups) * rows_per_tg + simd_group;
+    if (row >= out_rows) return;
+
+    const device uchar *base = pool + (ulong)pair_slot[pair] * (ulong)args.expert_size;
+    uint scale_groups = in_dim / 64u;
+    const device ushort *gate_scale_row = (const device ushort *)(base + args.gate_scales) + row * scale_groups;
+    const device ushort *gate_bias_row = (const device ushort *)(base + args.gate_biases) + row * scale_groups;
+    const device ushort *up_scale_row = (const device ushort *)(base + args.up_scales) + row * scale_groups;
+    const device ushort *up_bias_row = (const device ushort *)(base + args.up_biases) + row * scale_groups;
+
+    float gate_acc = 0.0f;
+    float up_acc = 0.0f;
+    if (args.bits == 3u) {
+        uint units = in_dim / 16u;
+        uint row_words = units * 3u / 2u;
+        const device uint *gate_row = (const device uint *)(base + args.gate_weight) + row * row_words;
+        const device uint *up_row = (const device uint *)(base + args.up_weight) + row * row_words;
+        for (uint u = simd_lane; u < units; u += 32u) {
+            uint base_col = u * 16u;
+            uint group = base_col / 64u;
+            gate_acc += nmoe_q3_unit_dot(gate_row, u, nmoe_bf16_to_f32(gate_scale_row[group]),
+                                         nmoe_bf16_to_f32(gate_bias_row[group]), x_shared, base_col);
+            up_acc += nmoe_q3_unit_dot(up_row, u, nmoe_bf16_to_f32(up_scale_row[group]),
+                                       nmoe_bf16_to_f32(up_bias_row[group]), x_shared, base_col);
+        }
+    } else {
+        uint packed_cols = in_dim / 8u;
+        const device uint *gate_row = (const device uint *)(base + args.gate_weight) + row * packed_cols;
+        const device uint *up_row = (const device uint *)(base + args.up_weight) + row * packed_cols;
+        for (uint pi = simd_lane; pi < packed_cols; pi += 32u) {
+            uint base_col = pi * 8u;
+            uint group = base_col / 64u;
+            float gate_scale = nmoe_bf16_to_f32(gate_scale_row[group]);
+            float gate_bias = nmoe_bf16_to_f32(gate_bias_row[group]);
+            float up_scale = nmoe_bf16_to_f32(up_scale_row[group]);
+            float up_bias = nmoe_bf16_to_f32(up_bias_row[group]);
+            uint gate_word = gate_row[pi];
+            uint up_word = up_row[pi];
+            for (uint lane = 0u; lane < 8u; ++lane) {
+                uint col = base_col + lane;
+                if (col >= in_dim) break;
+                float x = x_shared[col];
+                uint shift = lane * 4u;
+                gate_acc += fma((float)((gate_word >> shift) & 0xFu), gate_scale, gate_bias) * x;
+                up_acc += fma((float)((up_word >> shift) & 0xFu), up_scale, up_bias) * x;
+            }
+        }
+    }
+    float gate_sum = simd_sum(gate_acc);
+    float up_sum = simd_sum(up_acc);
+    if (simd_lane == 0u) {
+        act[pair * out_rows + row] = nmoe_silu(gate_sum) * up_sum;
+    }
+}
+
+kernel void nmoe_prefill_expert_down(
+    const device uchar *pool [[buffer(0)]],
+    const device float *act [[buffer(1)]],
+    device float *pair_out [[buffer(2)]],
+    const device uint *pair_list [[buffer(3)]],
+    const device uint *pair_slot [[buffer(4)]],
+    constant NMOEPrefillArgs &args [[buffer(5)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]])
+{
+    const uint out_rows = 2048u;
+    const uint in_dim = 512u;
+    uint rows_per_tg = args.rows_per_tg;
+    uint row_groups = out_rows / rows_per_tg;
+    uint list_idx = tgid / row_groups;
+    if (list_idx >= args.list_count || simd_group >= rows_per_tg) return;
+    uint row = (tgid - list_idx * row_groups) * rows_per_tg + simd_group;
+    uint pair = pair_list[list_idx];
+
+    const device uchar *base = pool + (ulong)pair_slot[pair] * (ulong)args.expert_size;
+    uint scale_groups = in_dim / 64u;
+    const device ushort *scale_row = (const device ushort *)(base + args.down_scales) + row * scale_groups;
+    const device ushort *bias_row = (const device ushort *)(base + args.down_biases) + row * scale_groups;
+    const device float *expert_act = act + pair * in_dim;
+
+    float acc = 0.0f;
+    if (args.bits == 3u) {
+        uint units = in_dim / 16u;
+        uint row_words = units * 3u / 2u;
+        const device uint *weight_row = (const device uint *)(base + args.down_weight) + row * row_words;
+        for (uint u = simd_lane; u < units; u += 32u) {
+            uint base_col = u * 16u;
+            uint group = base_col / 64u;
+            acc += nmoe_q3_unit_dot_device(weight_row, u, nmoe_bf16_to_f32(scale_row[group]),
+                                           nmoe_bf16_to_f32(bias_row[group]), expert_act, base_col);
+        }
+    } else {
+        uint packed_cols = in_dim / 8u;
+        const device uint *weight_row = (const device uint *)(base + args.down_weight) + row * packed_cols;
+        for (uint pi = simd_lane; pi < packed_cols; pi += 32u) {
+            uint word = weight_row[pi];
+            uint base_col = pi * 8u;
+            uint group = base_col / 64u;
+            float scale = nmoe_bf16_to_f32(scale_row[group]);
+            float bias = nmoe_bf16_to_f32(bias_row[group]);
+            for (uint lane = 0u; lane < 8u; ++lane) {
+                uint col = base_col + lane;
+                if (col >= in_dim) break;
+                acc += fma((float)((word >> (lane * 4u)) & 0xFu), scale, bias) * expert_act[col];
+            }
+        }
+    }
+    float down_sum = simd_sum(acc);
+    if (simd_lane == 0u) {
+        pair_out[pair * out_rows + row] = down_sum;
+    }
+}
+
+// hidden_out[t] = h_mid[t] + sum_k w[t][k] * pair_out[t*8+k] + sigmoid(gate[t]) * shared_down(shared_act[t])
+kernel void nmoe_prefill_combine(
+    const device float *pair_out [[buffer(0)]],
+    const device float *h_mid [[buffer(1)]],
+    device float *hidden_out [[buffer(2)]],
+    const device float *weights [[buffer(3)]],
+    const device uint *kept [[buffer(4)]],
+    const device float *shared_gate [[buffer(5)]],
+    const device uint *shared_weight [[buffer(6)]],
+    const device ushort *shared_scales [[buffer(7)]],
+    const device ushort *shared_biases [[buffer(8)]],
+    const device float *shared_act [[buffer(9)]],
+    constant NMOEPrefillArgs &args [[buffer(10)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]])
+{
+    const uint dim = 2048u;
+    const uint in_dim = 512u;
+    uint rows_per_tg = args.rows_per_tg;
+    uint row_groups = dim / rows_per_tg;
+    uint token = tgid / row_groups;
+    if (token >= args.token_count || simd_group >= rows_per_tg) return;
+    uint row = (tgid - token * row_groups) * rows_per_tg + simd_group;
+
+    float moe = 0.0f;
+    uint k = min(kept[token], 8u);
+    for (uint slot = 0u; slot < k; ++slot) {
+        moe += weights[token * 8u + slot] * pair_out[(token * 8u + slot) * dim + row];
+    }
+
+    uint scale_groups = in_dim / 64u;
+    uint packed_cols = in_dim / 8u;
+    const device uint *shared_weight_row = shared_weight + row * packed_cols;
+    const device ushort *shared_scale_row = shared_scales + row * scale_groups;
+    const device ushort *shared_bias_row = shared_biases + row * scale_groups;
+    const device float *x = shared_act + token * in_dim;
+    float shared_acc = 0.0f;
+    for (uint pi = simd_lane; pi < packed_cols; pi += 32u) {
+        uint word = shared_weight_row[pi];
+        uint base_col = pi * 8u;
+        uint group = base_col / 64u;
+        float scale = nmoe_bf16_to_f32(shared_scale_row[group]);
+        float bias = nmoe_bf16_to_f32(shared_bias_row[group]);
+        for (uint lane = 0u; lane < 8u; ++lane) {
+            uint col = base_col + lane;
+            if (col >= in_dim) break;
+            shared_acc += fma((float)((word >> (lane * 4u)) & 0xFu), scale, bias) * x[col];
+        }
+    }
+    float shared_sum = simd_sum(shared_acc);
+    if (simd_lane == 0u) {
+        hidden_out[token * dim + row] = h_mid[token * dim + row] + moe + nmoe_sigmoid(shared_gate[token]) * shared_sum;
+    }
+}
+
+// ============================================================================
 // GPU copy (for KV cache updates inside command buffers)
 // ============================================================================
 
