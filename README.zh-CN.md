@@ -181,5 +181,9 @@ docs/optimization-log.zh-CN.md   详细优化记录
 - [CLAUDE.md](CLAUDE.md)（英文）：面向贡献者的架构说明，包括如何新增 Metal kernel、
   流水线必须遵守的约束，以及实验用的环境变量。
 
+## 许可证
+
+本仓库代码采用 [Apache License 2.0](LICENSE) 授权。
+
 本仓库不包含模型权重。权重来自
-[Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)，使用时须遵守其许可协议。
+[Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)，使用时须遵守其自身的许可协议。

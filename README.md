@@ -206,6 +206,10 @@ docs/optimization-log.zh-CN.md   detailed optimization log (Chinese)
   to add a Metal kernel, the pipeline invariants, and the experiment
   environment variables.
 
+## License
+
+The code in this repository is licensed under the [Apache License 2.0](LICENSE).
+
 Model weights are not included. They come from
 [Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) and are
-subject to its license.
+subject to their own license.

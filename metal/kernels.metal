@@ -182,6 +182,37 @@ static inline float nmoe_silu(float x) {
     return x * nmoe_sigmoid(x);
 }
 
+// Sum `v` across a threadgroup of up to 1024 threads and return the total to
+// every thread. `scratch` needs one float per simdgroup (32 is always enough).
+static inline float nmoe_threadgroup_total(float v, threadgroup float *scratch,
+                                           uint lid, uint threads)
+{
+    uint lane = lid & 31u;
+    uint group = lid >> 5u;
+    uint groups = (threads + 31u) >> 5u;
+    float partial = simd_sum(v);
+    if (lane == 0u) scratch[group] = partial;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total = simd_sum(lane < groups ? scratch[lane] : 0.0f);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return total;
+}
+
+static inline float2 nmoe_threadgroup_total2(float2 v, threadgroup float2 *scratch,
+                                             uint lid, uint threads)
+{
+    uint lane = lid & 31u;
+    uint group = lid >> 5u;
+    uint groups = (threads + 31u) >> 5u;
+    float2 partial = float2(simd_sum(v.x), simd_sum(v.y));
+    if (lane == 0u) scratch[group] = partial;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float2 mine = lane < groups ? scratch[lane] : float2(0.0f);
+    float2 total = float2(simd_sum(mine.x), simd_sum(mine.y));
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return total;
+}
+
 // ============================================================================
 // 4-bit / 2-bit dequant matvec — one SIMD group per output row.
 // ============================================================================
@@ -900,33 +931,6 @@ kernel void nmoe_rms_norm(
 }
 
 // Parallel RMS norm — sum + apply (NEW, for performance)
-kernel void nmoe_rms_norm_sum(
-    const device float *input [[buffer(0)]],
-    device float *sum_sq_out [[buffer(1)]],
-    constant uint &dim [[buffer(2)]],
-    uint tid [[thread_position_in_grid]],
-    uint lid [[thread_position_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]])
-{
-    threadgroup float shared[32];
-    float acc = 0.0f;
-    // CORRECT stride: total grid size, not tg_size
-    uint grid_size = tg_size; // will be fixed by dispatch with 1 threadgroup of 256
-    for (uint i = tid; i < dim; i += grid_size) {
-        float v = input[i];
-        acc += v * v;
-    }
-    float simd_val = simd_sum(acc);
-    uint simd_lane = lid % 32;
-    uint simd_group = lid / 32;
-    uint num_simd_groups = (tg_size + 31) / 32;
-    if (simd_lane == 0) shared[simd_group] = simd_val;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (simd_group == 0 && simd_lane < num_simd_groups) {
-        float val = simd_sum(shared[simd_lane]);
-        if (simd_lane == 0) sum_sq_out[0] = val;
-    }
-}
 
 kernel void nmoe_rms_norm_apply_bf16(
     const device float *input [[buffer(0)]],
@@ -1295,10 +1299,15 @@ kernel void nmoe_conv1d_step(
 }
 
 // ============================================================================
-// ORIGINAL GatedDeltaNet — single-threaded per head (correct behavior)
+// GatedDeltaNet (linear attention)
 // ============================================================================
 
-// TUI-proven parallel GatedDeltaNet step (no q_scale/k_scale — scaling in Q/K norm)
+// One recurrent step of GatedDeltaNet for one value head. Each of the
+// value_dim threads owns one row S[r][:] of the head's key_dim-wide state.
+// With s the old row, the update is
+//     S' = g*s + k*delta,  delta = beta * (v[r] - g*(s.k)),  out[r] = S'.q
+// and S'.q expands to g*(s.q) + delta*(k.q). So a single read pass gathers
+// s.k and s.q, and a single read-modify-write pass applies the update.
 kernel void nmoe_gated_delta_net_step(
     device float *state [[buffer(0)]],
     const device float *q [[buffer(1)]],
@@ -1309,40 +1318,45 @@ kernel void nmoe_gated_delta_net_step(
     device float *output [[buffer(6)]],
     constant NMOEGatedDeltaNetArgs &args [[buffer(7)]],
     uint vh [[threadgroup_position_in_grid]],
-    uint vi [[thread_position_in_threadgroup]])
+    uint r [[thread_position_in_threadgroup]],
+    uint threads [[threads_per_threadgroup]])
 {
-    if (vh >= args.v_heads || vi >= args.value_dim || args.key_dim == 0) return;
+    const uint kd = args.key_dim;
+    if (vh >= args.v_heads || kd == 0u || kd > 256u) return;
+    const uint group_heads = max(args.v_heads / max(args.kv_heads, 1u), 1u);
+    const device float *kh = k + (vh / group_heads) * kd;
+    const device float *qh = q + (vh / group_heads) * kd;
 
-    uint kv_heads = max(args.kv_heads, 1u);
-    uint head_ratio = max(args.v_heads / kv_heads, 1u);
-    uint kh = vh / head_ratio;
-    float g = g_decay[vh];
-    float beta_val = beta_gate[vh];
-
-    uint state_base = vh * args.value_dim * args.key_dim + vi * args.key_dim;
-    uint k_base = kh * args.key_dim;
-    uint v_base = vh * args.value_dim;
-
-    // Step 1+2: Decay state row and compute kv_mem = dot(S[vi][:], k[:])
-    float kv_mem = 0.0f;
-    for (uint ki = 0; ki < args.key_dim; ki++) {
-        float s = state[state_base + ki] * g;
-        state[state_base + ki] = s;
-        kv_mem += s * k[k_base + ki];
+    // Stage this head's k and q once for all rows.
+    threadgroup float k_tile[256];
+    threadgroup float q_tile[256];
+    threadgroup float2 scratch[32];
+    for (uint i = r; i < kd; i += threads) {
+        k_tile[i] = kh[i];
+        q_tile[i] = qh[i];
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Step 3+4: Delta update — S[vi][ki] += k[ki] * delta
-    float delta = (v[v_base + vi] - kv_mem) * beta_val;
-    for (uint ki = 0; ki < args.key_dim; ki++) {
-        state[state_base + ki] += k[k_base + ki] * delta;
-    }
+    // k.q is the same for every row of the head.
+    float2 kq_part = float2(0.0f);
+    for (uint i = r; i < kd; i += threads) kq_part.x += k_tile[i] * q_tile[i];
+    const float kq = nmoe_threadgroup_total2(kq_part, scratch, r, threads).x;
+    if (r >= args.value_dim) return;
 
-    // Step 5: Output — out[vi] = dot(S[vi][:], q[:])
-    float out_val = 0.0f;
-    for (uint ki = 0; ki < args.key_dim; ki++) {
-        out_val += state[state_base + ki] * q[k_base + ki];
+    device float *row = state + ((ulong)vh * args.value_dim + r) * kd;
+    float sk = 0.0f;
+    float sq = 0.0f;
+    for (uint i = 0u; i < kd; ++i) {
+        float si = row[i];
+        sk = fma(si, k_tile[i], sk);
+        sq = fma(si, q_tile[i], sq);
     }
-    output[v_base + vi] = out_val;
+    const float g = g_decay[vh];
+    const float delta = beta_gate[vh] * (v[vh * args.value_dim + r] - g * sk);
+    for (uint i = 0u; i < kd; ++i) {
+        row[i] = fma(k_tile[i], delta, g * row[i]);
+    }
+    output[vh * args.value_dim + r] = fma(delta, kq, g * sq);
 }
 
 // ============================================================================
@@ -1391,6 +1405,25 @@ kernel void nmoe_residual_add(
     out[tid] = a[tid] + b[tid];
 }
 
+static inline const device float *nmoe_pick_expert_out(
+    uint slot,
+    const device float *o0, const device float *o1, const device float *o2, const device float *o3,
+    const device float *o4, const device float *o5, const device float *o6, const device float *o7)
+{
+    switch (slot) {
+        case 0u: return o0;
+        case 1u: return o1;
+        case 2u: return o2;
+        case 3u: return o3;
+        case 4u: return o4;
+        case 5u: return o5;
+        case 6u: return o6;
+        default: return o7;
+    }
+}
+
+// hidden_out = h_mid + sum_slot params[slot] * expert_out[slot]
+//              + sigmoid(params[8]) * shared_out
 kernel void nmoe_weighted_expert_sum(
     const device float *h_mid [[buffer(0)]],
     const device float *shared_out [[buffer(1)]],
@@ -1409,17 +1442,14 @@ kernel void nmoe_weighted_expert_sum(
     uint tid [[thread_position_in_grid]])
 {
     if (tid >= dim) return;
-    float shared_gate = nmoe_sigmoid(params[8]);
-    float moe = 0.0f;
-    if (K > 0) moe += params[0] * expert_out0[tid];
-    if (K > 1) moe += params[1] * expert_out1[tid];
-    if (K > 2) moe += params[2] * expert_out2[tid];
-    if (K > 3) moe += params[3] * expert_out3[tid];
-    if (K > 4) moe += params[4] * expert_out4[tid];
-    if (K > 5) moe += params[5] * expert_out5[tid];
-    if (K > 6) moe += params[6] * expert_out6[tid];
-    if (K > 7) moe += params[7] * expert_out7[tid];
-    hidden_out[tid] = h_mid[tid] + moe + shared_gate * shared_out[tid];
+    float routed = 0.0f;
+    const uint slots = min(K, 8u);
+    for (uint slot = 0u; slot < slots; ++slot) {
+        const device float *out = nmoe_pick_expert_out(slot, expert_out0, expert_out1, expert_out2, expert_out3,
+                                                       expert_out4, expert_out5, expert_out6, expert_out7);
+        routed = fma(params[slot], out[tid], routed);
+    }
+    hidden_out[tid] = h_mid[tid] + routed + nmoe_sigmoid(params[8]) * shared_out[tid];
 }
 
 kernel void nmoe_weighted_expert_sum_routed(
@@ -2205,8 +2235,9 @@ kernel void nmoe_route_topk(
     }
 }
 
-// Per-head bare RMS normalize for q and k (linear attention).
-// Applies inv_scale^2 to q and inv_scale to k (TUI-compatible scaling).
+// Linear-attention q/k normalization, one threadgroup per key head: both
+// vectors are RMS-normalized (no learned weight) with a single fused
+// reduction, then q is scaled by inv_scale^2 and k by inv_scale.
 kernel void nmoe_rms_norm_qk(
     device float *q [[buffer(0)]],
     device float *k [[buffer(1)]],
@@ -2214,42 +2245,31 @@ kernel void nmoe_rms_norm_qk(
     constant float &inv_scale [[buffer(3)]],
     constant float &eps [[buffer(4)]],
     uint head [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]])
+    uint lid [[thread_position_in_threadgroup]],
+    uint threads [[threads_per_threadgroup]])
 {
-    uint base = head * key_dim;
-
-    // RMS norm for q (bare norm, then scale with inv_scale^2)
-    threadgroup float q_partial[128];
-    float qval = (tid < key_dim) ? q[base + tid] : 0.0f;
-    q_partial[tid] = qval * qval;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0) {
-        float s = 0.0f;
-        for (uint i = 0; i < key_dim; i++) s += q_partial[i];
-        q_partial[0] = s;
+    threadgroup float2 scratch[32];
+    device float *qh = q + head * key_dim;
+    device float *kh = k + head * key_dim;
+    float2 sq = float2(0.0f);
+    for (uint i = lid; i < key_dim; i += threads) {
+        float qi = qh[i];
+        float ki = kh[i];
+        sq += float2(qi * qi, ki * ki);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float q_inv_rms = rsqrt(q_partial[0] / (float)key_dim + eps);
-    if (tid < key_dim) q[base + tid] = qval * q_inv_rms * inv_scale * inv_scale;
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // RMS norm for k (bare norm, then scale with inv_scale)
-    threadgroup float k_partial[128];
-    float kval = (tid < key_dim) ? k[base + tid] : 0.0f;
-    k_partial[tid] = kval * kval;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0) {
-        float s = 0.0f;
-        for (uint i = 0; i < key_dim; i++) s += k_partial[i];
-        k_partial[0] = s;
+    float2 total = nmoe_threadgroup_total2(sq, scratch, lid, threads);
+    float2 inv = rsqrt(total / (float)key_dim + eps);
+    float q_mul = inv.x * inv_scale * inv_scale;
+    float k_mul = inv.y * inv_scale;
+    for (uint i = lid; i < key_dim; i += threads) {
+        qh[i] *= q_mul;
+        kh[i] *= k_mul;
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float k_inv_rms = rsqrt(k_partial[0] / (float)key_dim + eps);
-    if (tid < key_dim) k[base + tid] = kval * k_inv_rms * inv_scale;
 }
 
-// Compute g_decay and beta_gate for GatedDeltaNet
+// Per value head: decay g = exp(-exp(A_log) * softplus(alpha + dt_bias)) and
+// write gate beta = sigmoid(beta_logit). softplus uses the overflow-safe form
+// max(x, 0) + log(1 + exp(-|x|)).
 kernel void nmoe_compute_decay_beta(
     const device float *alpha_out [[buffer(0)]],
     const device float *beta_out [[buffer(1)]],
@@ -2257,17 +2277,18 @@ kernel void nmoe_compute_decay_beta(
     const device ushort *dt_bias [[buffer(3)]],
     device float *g_decay [[buffer(4)]],
     device float *beta_gate [[buffer(5)]],
-    uint idx [[thread_position_in_grid]])
+    uint h [[thread_position_in_grid]])
 {
-    float a_val = alpha_out[idx];
-    float dt_b = nmoe_bf16_to_f32(dt_bias[idx]);
-    float A_val = exp(A_log[idx]);
-    float softplus_val = log(1.0f + exp(a_val + dt_b));
-    g_decay[idx] = exp(-A_val * softplus_val);
-    beta_gate[idx] = nmoe_sigmoid(beta_out[idx]);
+    float x = alpha_out[h] + nmoe_bf16_to_f32(dt_bias[h]);
+    float softplus = max(x, 0.0f) + log(1.0f + exp(-fabs(x)));
+    float rate = exp(A_log[h]);
+    float beta = nmoe_sigmoid(beta_out[h]);
+    g_decay[h] = exp(-rate * softplus);
+    beta_gate[h] = beta;
 }
 
-// Gated RMS norm (z-gated output normalization)
+// Output norm of the linear-attention block, one threadgroup per value head:
+// out = rmsnorm(values) * weight * silu(z), weight shared across heads.
 kernel void nmoe_gated_rms_norm(
     const device float *values [[buffer(0)]],
     const device float *z [[buffer(1)]],
@@ -2275,29 +2296,23 @@ kernel void nmoe_gated_rms_norm(
     device float *output [[buffer(3)]],
     constant NMOEGatedDeltaNetArgs &args [[buffer(4)]],
     uint vh [[threadgroup_position_in_grid]],
-    uint vi [[thread_position_in_threadgroup]])
+    uint lid [[thread_position_in_threadgroup]],
+    uint threads [[threads_per_threadgroup]])
 {
-    if (vh >= args.v_heads || vi >= args.value_dim) return;
-    uint base = vh * args.value_dim;
-
-    // RMS norm reduction within threadgroup
-    threadgroup float partial[128];
-    float val = values[base + vi];
-    partial[vi] = val * val;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (vi == 0) {
-        float s = 0.0f;
-        for (uint i = 0; i < args.value_dim; i++) s += partial[i];
-        partial[0] = s;
+    if (vh >= args.v_heads) return;
+    threadgroup float scratch[32];
+    const uint n = args.value_dim;
+    const uint off = vh * n;
+    float ss = 0.0f;
+    for (uint i = lid; i < n; i += threads) {
+        float x = values[off + i];
+        ss = fma(x, x, ss);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float inv_rms = rsqrt(partial[0] / (float)args.value_dim + args.epsilon);
-
-    float normed = val * inv_rms;
-    float zval = z[base + vi];
-    float gate = nmoe_silu(zval);
-    float w = nmoe_bf16_to_f32(norm_weight[vi]);
-    output[base + vi] = normed * gate * w;
+    float inv = rsqrt(nmoe_threadgroup_total(ss, scratch, lid, threads) / (float)n + args.epsilon);
+    for (uint i = lid; i < n; i += threads) {
+        float gate = nmoe_silu(z[off + i]);
+        output[off + i] = values[off + i] * inv * nmoe_bf16_to_f32(norm_weight[i]) * gate;
+    }
 }
 
 // ============================================================================
